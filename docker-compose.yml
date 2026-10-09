@@ -1,0 +1,66 @@
+# Lore Server (https://lore.org) — single-node production deployment.
+#
+#   cp .env.example .env   # set LORE_DOMAIN
+#   ./scripts/issue-cert.sh
+#   docker compose up -d
+#
+# See docs/DEPLOYMENT.md for the full procedure.
+
+name: lore
+
+services:
+  loreserver:
+    # Official image, published by EpicGames from release binaries.
+    # Unsuffixed tags are linux/amd64 ONLY. Do not run on Ampere/ARM hosts
+    # (e.g. Hetzner CAX) — the arm64 build targets AWS Graviton3+ and SIGILLs elsewhere.
+    image: ghcr.io/epicgames/lore/loreserver:${LORE_VERSION:-0.10.1}
+    platform: linux/amd64
+    container_name: loreserver
+    restart: unless-stopped
+    init: true
+
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      # Image defaults: LORE_CONFIG_PATH=/etc/lore/config, LORE_ENV=docker
+      # (docker.toml points both stores at /data). Our local.toml layers on top.
+
+    ports:
+      # 41337 carries gRPC over TCP and QUIC over UDP — both are required.
+      - "${LORE_BIND_ADDR:-0.0.0.0}:41337:41337/tcp"
+      - "${LORE_BIND_ADDR:-0.0.0.0}:41337:41337/udp"
+      # HTTP: health check (+ presigned URLs if ever enabled). Plain HTTP, so
+      # keep it on loopback. Clients do not need it with the default config.
+      - "127.0.0.1:41339:41339/tcp"
+
+    volumes:
+      - ./config/local.toml:/etc/lore/config/local.toml:ro
+      # Real files (not symlinks) copied here by scripts/certbot-deploy-hook.sh
+      - ./certs:/etc/lore/certs:ro
+      # Immutable + mutable stores. Back this up.
+      - ${LORE_DATA_DIR:-./data}:/data
+
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+
+    # connection_close_timeout (5s) + runtime_shutdown_timeout (25s) + margin
+    stop_grace_period: 40s
+
+    # The image is debian-slim without curl; use bash's /dev/tcp.
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/41339 && printf "GET /health_check HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 && head -n1 <&3 | grep -q " 200 "'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

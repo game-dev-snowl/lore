@@ -1,0 +1,50 @@
+# Lore Server overlay config. Layered on top of (in order):
+#   compiled-in default.toml -> /etc/lore/config/default.toml -> docker.toml (LORE_ENV=docker) -> this file -> LORE__* env vars
+# Reference: https://epicgames.github.io/lore/reference/lore-server-config/
+#
+# docker.toml in the image already sets both store paths to /data; they are
+# repeated here so this file is the single readable source of truth.
+
+# --- TLS ---------------------------------------------------------------------
+# Clients using lores:// verify the certificate on BOTH transports:
+#   QUIC (UDP 41337) and gRPC over HTTPS (TCP 41337).
+# So both endpoints get the Let's Encrypt cert. Without the gRPC block a
+# lores:// client would try TLS against a plaintext gRPC listener.
+
+[server.quic.certificate]
+cert_file = "/etc/lore/certs/fullchain.pem"
+pkey_file = "/etc/lore/certs/privkey.pem"
+
+[server.grpc.certificate]
+cert_file = "/etc/lore/certs/fullchain.pem"
+pkey_file = "/etc/lore/certs/privkey.pem"
+
+# --- Storage -----------------------------------------------------------------
+
+[immutable_store.local]
+path = "/data"
+flush_delay_seconds = 10
+
+[mutable_store.local]
+path = "/data"
+flush_delay_seconds = 10
+
+# --- Logging -----------------------------------------------------------------
+
+[telemetry.logger]
+format = "json"
+output = "stdout"
+
+# --- Authentication (DISABLED) ----------------------------------------------
+# With no [server.auth] table the server accepts UNAUTHENTICATED requests:
+# anyone who can reach port 41337 can list, clone and push every repository.
+# To enable JWT auth (e.g. Keycloak) — UNTESTED starting point; read the
+# "Authentication" section of the config reference before relying on it:
+#
+# [server.auth]
+# jwt_issuer   = "https://keycloak.example.com/realms/lore"
+# jwt_audience = ["lore-service"]
+#
+# [server.auth.oidc]
+# client_id = "lore-cli"
+# scopes    = ["openid", "offline_access"]

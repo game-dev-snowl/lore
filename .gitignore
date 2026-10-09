@@ -1,0 +1,12 @@
+# Secrets & host-local state
+.env
+certs/*
+!certs/.gitkeep
+data/
+backups/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
