@@ -23,7 +23,14 @@ Docker Compose deployment of [Lore](https://lore.org) (Epic Games' open-source V
     └── DEPLOYMENT.md           # deploy, connect clients, upgrade, backup, troubleshoot
 ```
 
-## Quick start (on the server)
+## Two modes
+
+| Mode | TLS | Runbook |
+|---|---|---|
+| **LAN-only** (home server) | private CA (`scripts/make-local-ca.sh`) | [docs/HOME-LAN.md](docs/HOME-LAN.md) |
+| **Public** (VPS / datacenter) | Let's Encrypt (`scripts/issue-cert.sh`) | [docs/LINUX-SETUP.md](docs/LINUX-SETUP.md) → [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
+
+## Quick start: public mode (on the server)
 
 ```bash
 git clone <this-repo> /opt/lore && cd /opt/lore

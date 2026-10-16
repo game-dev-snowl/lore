@@ -1,6 +1,7 @@
 # Secrets & host-local state
 .env
 certs/*
+ca/
 !certs/.gitkeep
 data/
 backups/

@@ -3,6 +3,7 @@
 # Idempotent: safe to re-run.
 #
 #   sudo ./scripts/setup-server.sh [deploy-user]
+#   sudo LORE_LAN_CIDR=192.168.1.0/24 ./scripts/setup-server.sh [deploy-user]   # LAN-only host
 #
 # Does: base packages, unattended security upgrades, Docker Engine + Compose
 # plugin, certbot, UFW firewall, QUIC-friendly UDP buffers, data directory.
@@ -73,9 +74,15 @@ echo "==> Firewall (UFW)"
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow OpenSSH
-ufw allow 80/tcp     comment "certbot HTTP-01 challenge"
-ufw allow 41337/tcp  comment "lore gRPC"
-ufw allow 41337/udp  comment "lore QUIC"
+if [[ -n "${LORE_LAN_CIDR:-}" ]]; then
+  # LAN mode: no port 80 (no Let's Encrypt), 41337 only from the local subnet
+  ufw allow from "$LORE_LAN_CIDR" to any port 41337 proto tcp comment "lore gRPC (LAN)"
+  ufw allow from "$LORE_LAN_CIDR" to any port 41337 proto udp comment "lore QUIC (LAN)"
+else
+  ufw allow 80/tcp     comment "certbot HTTP-01 challenge"
+  ufw allow 41337/tcp  comment "lore gRPC"
+  ufw allow 41337/udp  comment "lore QUIC"
+fi
 ufw --force enable
 # NOTE: Docker-published ports bypass UFW (Docker writes iptables directly).
 # Restrict 41337 with LORE_BIND_ADDR in .env, the DOCKER-USER chain, or the
