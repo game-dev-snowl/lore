@@ -48,7 +48,7 @@ From a **second terminal**: `ssh deploy@SERVER_IP` must work before you close th
 
 ## 4. Run the setup script
 
-First copy this folder to the server. Run this **on your machine, from this folder** ([details](DEPLOYMENT.md#0-copy-the-files-to-the-server)):
+To run from a git clone instead, do [GIT-DEPLOY.md](GIT-DEPLOY.md) A.1 here and run the script below from `/opt/lore/deploy`, without `LORE_LAN_CIDR`. Otherwise, copy this folder to the server. Run this **on your machine, from this folder** ([details](DEPLOYMENT.md#0-copy-the-files-to-the-server)):
 
 ```bash
 ssh deploy@<server> 'sudo mkdir -p /opt/lore && sudo chown deploy: /opt/lore'

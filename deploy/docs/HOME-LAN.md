@@ -18,7 +18,7 @@ These are the values for this deployment. Change them if yours differ:
 
 ## 1. Prepare the host
 
-To run from a git clone and update with `git pull` instead, follow [GIT-DEPLOY.md](GIT-DEPLOY.md), which replaces this step and uses `/opt/lore/deploy` in place of `/opt/lore`.
+To run from a git clone and update with `git pull` instead, follow [GIT-DEPLOY.md](GIT-DEPLOY.md). It replaces steps 1 to 3 and the backup cron line in step 7, then sends you back here for step 4, and uses `/opt/lore/deploy` in place of `/opt/lore`.
 
 Otherwise, copy this folder to the server. Run this **on your machine, from this folder** ([details](DEPLOYMENT.md#0-copy-the-files-to-the-server)):
 

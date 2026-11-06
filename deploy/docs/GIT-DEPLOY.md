@@ -2,9 +2,9 @@
 
 This runbook puts a clone of [game-dev-snowl/lore](https://github.com/game-dev-snowl/lore) at `/opt/lore` on the server, instead of the copy made with `rsync`. The deployment runs from `/opt/lore/deploy`, and an update is a `git pull`.
 
-The clone is sparse: it checks out `deploy/` and the files at the repository root, about 4 MB, not Lore's source. The repository is public, so the server needs no GitHub credentials.
+The clone is sparse and blob-less: it checks out `deploy/` and the files at the repository root, a few MB, not Lore's source. The repository is public, so the server needs no GitHub credentials.
 
-The values below are for the home-LAN server. For the public mode, follow [DEPLOYMENT.md](DEPLOYMENT.md) from step 1, running every command in `/opt/lore/deploy`.
+The values below are for the home-LAN server. For the public mode, do A.1, run A.2 without `LORE_LAN_CIDR=…`, then follow [DEPLOYMENT.md](DEPLOYMENT.md) from step 1, running every command in `/opt/lore/deploy`. Where [AUTH0.md](AUTH0.md) or [LINUX-SETUP.md](LINUX-SETUP.md) say to copy files with rsync and `cd /opt/lore`, use `git pull` and `cd /opt/lore/deploy` instead.
 
 | Value | Meaning |
 |---|---|
@@ -23,7 +23,7 @@ The values below are for the home-LAN server. For the public mode, follow [DEPLO
 
 The scripts find their folder from their own path, so they work unchanged in `/opt/lore/deploy`. The Compose project is named `lore` in `docker-compose.yml`, so the container stays `loreserver` whichever folder it runs from. The stores live in `LORE_DATA_DIR` (`/srv/lore/data`), outside the clone, and aren't touched.
 
-Never edit tracked files on the server, such as `config/local.toml` or `docker-compose.yml`: the next `git pull` refuses to run. Change them in the repository, push to `main`, and pull.
+Never edit tracked files on the server, such as `config/local.toml` or `docker-compose.yml`: a `git pull` that changes the same file refuses to run, and one that doesn't leaves the server out of step with the repository. Change them in the repository, push to `main`, and pull.
 
 ## A. Fresh server
 
@@ -40,6 +40,7 @@ git clone --filter=blob:none --sparse https://github.com/game-dev-snowl/lore.git
 git -C /opt/lore sparse-checkout set deploy
 cd /opt/lore/deploy
 ls                       # README.md  auth0  certs  config  docker-compose.yml  docs  scripts
+grep -q LORE_HTTP_BIND_ADDR docker-compose.yml && echo "LAN changes present" || echo "STOP: main is missing the LAN changes"
 ```
 
 ### 2. Prepare the host
@@ -122,13 +123,30 @@ sudo mkdir -p /opt/lore && sudo chown "$USER": /opt/lore
 git clone --filter=blob:none --sparse https://github.com/game-dev-snowl/lore.git /opt/lore
 git -C /opt/lore sparse-checkout set deploy
 cd /opt/lore/deploy
+grep -q LORE_HTTP_BIND_ADDR docker-compose.yml && echo "LAN changes present" || echo "STOP: main is missing the LAN changes"
 
 cp -a /opt/lore.old/.env .env
-sudo cp -a /opt/lore.old/certs/. certs/
+sudo cp -a /opt/lore.old/certs/*.pem certs/
 [ -d /opt/lore.old/ca ] && sudo cp -a /opt/lore.old/ca ca
 ```
 
-Then add the line that publishes plain HTTP on the LAN, if `.env` doesn't have it yet:
+Check that the certificate and the CA came across. Each `cmp` must print nothing:
+
+```bash
+sudo ls -la certs/ ca/
+sudo cmp /opt/lore.old/certs/privkey.pem certs/privkey.pem
+sudo cmp /opt/lore.old/ca/ca.key ca/ca.key        # LAN mode
+```
+
+Check what else differs between the old copy and the clone:
+
+```bash
+diff -r -x .env -x certs -x ca -x data -x backups -x .git /opt/lore.old /opt/lore/deploy
+```
+
+Any difference, such as a `config/local.toml` changed on the server or rsynced from uncommitted work, is lost with the old copy. Commit it to the repository, then `git pull` here before you go on.
+
+LAN mode only: add the line that publishes plain HTTP on the LAN, if `.env` doesn't have it yet. Never on a public host.
 
 ```bash
 grep -q '^LORE_HTTP_BIND_ADDR=' .env || printf '\nLORE_HTTP_BIND_ADDR=192.168.1.29\n' >> .env
@@ -146,28 +164,44 @@ Clients need no change: the certificate and the CA are the same files.
 
 ### 5. Point the scheduled jobs at the new folder
 
+If `/etc/cron.d/lore-backup` doesn't exist, no backup was scheduled: create it with the line in [A.5](#5-schedule-backups) instead.
+
 ```bash
 sudo sed -i 's#/opt/lore/scripts/#/opt/lore/deploy/scripts/#' /etc/cron.d/lore-backup
 cat /etc/cron.d/lore-backup
 ```
 
-Public mode only: certbot stores the deploy hook's path with the certificate. Point it at the new folder and test it:
+Public mode only: certbot stores the deploy hook's path with the certificate. Point it at the new folder, then run the hook once by hand (`certbot renew --dry-run` skips deploy hooks, so it doesn't test this):
 
 ```bash
 sudo sed -i 's#LORE_DIR=/opt/lore /opt/lore/scripts/#LORE_DIR=/opt/lore/deploy /opt/lore/deploy/scripts/#' /etc/letsencrypt/renewal/*.conf
 sudo grep renew_hook /etc/letsencrypt/renewal/*.conf   # certbot stores --deploy-hook as renew_hook
-sudo certbot renew --dry-run
+sudo RENEWED_LINEAGE=/etc/letsencrypt/live/<LORE_DOMAIN> LORE_DIR=/opt/lore/deploy /opt/lore/deploy/scripts/certbot-deploy-hook.sh
 ```
 
 ### 6. Remove the old copy
 
-Once the server has run healthy for a day and a backup has run from the new path:
+Only once all of these hold:
+
+- the server has run healthy for a day,
+- a backup has run from the new path (`ls -l /srv/lore/backups`),
+- `/opt/lore/deploy/.env` and `/opt/lore/deploy/ca/` are copied off the box. `ca/ca.key` can't be recreated: a new CA means every client has to trust it again.
 
 ```bash
 sudo rm -rf /opt/lore.old
 ```
 
-To roll back before then: `cd /opt/lore/deploy && docker compose down`, swap the folders back (`sudo mv /opt/lore /opt/lore.git && sudo mv /opt/lore.old /opt/lore`), and run `docker compose up -d` in `/opt/lore`.
+To roll back before then:
+
+```bash
+cd /opt/lore/deploy && docker compose down
+cd /
+sudo mv /opt/lore /opt/lore.git && sudo mv /opt/lore.old /opt/lore
+sudo sed -i 's#/opt/lore/deploy/scripts/#/opt/lore/scripts/#' /etc/cron.d/lore-backup
+cd /opt/lore && docker compose up -d
+```
+
+If you changed the certbot `renew_hook` in step 5, reverse that `sed` too.
 
 ## Updating
 
@@ -189,5 +223,6 @@ Upgrading the Lore image is still a `.env` change: bump `LORE_VERSION`, then `do
 | `git pull` says local changes would be overwritten | A tracked file was edited on the server. `git diff` shows it. Move the change to the repository, then `git checkout -- <file>` and pull again. |
 | `ls /opt/lore/deploy` doesn't exist | The `sparse-checkout set deploy` step was skipped. Run it in `/opt/lore`. |
 | `fatal: detected dubious ownership` | git is running as a user other than the owner of `/opt/lore`, e.g. under `sudo`. Run `git pull` as your own user, without `sudo`. |
-| Container keeps restarting after the move | `certs/` is empty. Copy the files from `/opt/lore.old/certs`, or run `make-local-ca.sh` again (it reuses `ca/`). |
-| `docker compose` says the container name `loreserver` is in use | The old copy is still running. Run `docker compose down` in `/opt/lore.old`. |
+| Container keeps restarting after the move | `certs/` is empty. Copy the `.pem` files from `/opt/lore.old/certs`. Run `make-local-ca.sh` again only if `ca/ca.key` is present: without it the script creates a new CA and every client has to trust it again. |
+| `git status` says permission denied on `certs/` | `certs/` became root-owned. Run `sudo chown "$USER": certs` (the `.pem` files keep their owner and mode). |
+| `curl …:41339` refused, but `docker compose ps` says healthy | The clone came from a `main` without `LORE_HTTP_BIND_ADDR`, so 41339 is on loopback. Merge the LAN changes to `main` and `git pull`. |
