@@ -150,9 +150,9 @@ The server logs a warning when free space on the store volume drops below 10 GiB
 | `PluginNotFound` at startup | `aws` was selected as the store or lock mode. The stock image doesn't include the AWS plugin. |
 | Unhealthy and nothing on 41339 | Run `docker compose logs loreserver`. A config key may have been removed in a newer `LORE_VERSION`. |
 
-## 7. Enabling authentication later
+## 7. Enabling authentication
 
-The server is currently **unauthenticated**. When you're ready, configure an OIDC provider (Keycloak works) and add `[server.auth]` + `[server.auth.oidc]` to `config/local.toml`. A commented starting point is in that file. The fields `jwt_issuer`, `jwt_audience`, `permission_claim`, `resource_claim` and the rest are documented in the [config reference](https://epicgames.github.io/lore/reference/lore-server-config/#authentication).
+Out of the box the server is **unauthenticated**. To require sign-in with Auth0 and role-based permissions, follow [AUTH0.md](AUTH0.md). The Auth0 block is already in `config/local.toml`, commented out. Other OIDC providers (e.g. Keycloak) use the same `[server.auth]` + `[server.auth.oidc]` tables. The fields `jwt_issuer`, `jwt_audience`, `permission_claim`, `resource_claim` and the rest are documented in the [config reference](https://epicgames.github.io/lore/reference/lore-server-config/#authentication).
 
 ## References
 

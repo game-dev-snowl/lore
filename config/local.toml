@@ -35,16 +35,27 @@ flush_delay_seconds = 10
 format = "json"
 output = "stdout"
 
-# --- Authentication (DISABLED) ----------------------------------------------
+# --- Authentication: Auth0 (DISABLED until you uncomment) -------------------
 # With no [server.auth] table the server accepts UNAUTHENTICATED requests:
 # anyone who can reach port 41337 can list, clone and push every repository.
-# To enable JWT auth (e.g. Keycloak) — UNTESTED starting point; read the
-# "Authentication" section of the config reference before relying on it:
+#
+# To enable Auth0, follow docs/AUTH0.md, then uncomment the block below and
+# replace the three <...> values. The server needs outbound HTTPS to your
+# tenant to fetch its signing keys (OIDC discovery on jwt_issuer).
 #
 # [server.auth]
-# jwt_issuer   = "https://keycloak.example.com/realms/lore"
-# jwt_audience = ["lore-service"]
+# # Exactly as Auth0 issues it — the trailing slash is required.
+# jwt_issuer   = "https://<TENANT>.auth0.com/"
+# # The Identifier of the Auth0 API you created (not the app's Client ID).
+# jwt_audience = ["<API_IDENTIFIER>"]
+# # Auth0 RBAC writes the user's role permissions to a top-level "permissions"
+# # array: read, write, admin, obliterate.
+# permission_claim = "permissions"
+# # Default is ["write"] for every token holder. Empty = a logged-in user with
+# # no Auth0 role gets read only.
+# implicit_actions = []
 #
 # [server.auth.oidc]
-# client_id = "lore-cli"
-# scopes    = ["openid", "offline_access"]
+# # Client ID of the Auth0 Native application `lore login` signs in with.
+# client_id = "<NATIVE_APP_CLIENT_ID>"
+# scopes    = ["openid", "profile", "offline_access"]
