@@ -1,0 +1,64 @@
+# Lore Server overlay config. Layered on top of (in order):
+#   compiled-in default.toml -> /etc/lore/config/default.toml -> docker.toml (LORE_ENV=docker) -> this file -> LORE__* env vars
+# Reference: https://epicgames.github.io/lore/reference/lore-server-config/
+#
+# docker.toml in the image already sets both store paths to /data; they are
+# repeated here so this file is the single readable source of truth.
+
+# --- TLS ---------------------------------------------------------------------
+# Clients using lores:// verify the certificate on BOTH transports:
+#   QUIC (UDP 41337) and gRPC over HTTPS (TCP 41337).
+# So both endpoints get the Let's Encrypt cert. Without the gRPC block a
+# lores:// client would try TLS against a plaintext gRPC listener.
+
+[server.quic.certificate]
+cert_file = "/etc/lore/certs/fullchain.pem"
+pkey_file = "/etc/lore/certs/privkey.pem"
+
+[server.grpc.certificate]
+cert_file = "/etc/lore/certs/fullchain.pem"
+pkey_file = "/etc/lore/certs/privkey.pem"
+
+# --- Storage -----------------------------------------------------------------
+
+[immutable_store.local]
+path = "/data"
+flush_delay_seconds = 10
+
+[mutable_store.local]
+path = "/data"
+flush_delay_seconds = 10
+
+# --- Logging -----------------------------------------------------------------
+
+[telemetry.logger]
+format = "json"
+output = "stdout"
+
+# --- Authentication: Auth0 (ENABLED) -----------------------------------------
+# Setup and troubleshooting: docs/AUTH0.md. Removing the [server.auth] table
+# makes the server accept UNAUTHENTICATED requests again: anyone who can reach
+# port 41337 could list, clone, push and obliterate every repository.
+# The server needs outbound HTTPS to the tenant to fetch its signing keys
+# (OIDC discovery on jwt_issuer); if it can't, it refuses to start.
+
+[server.auth]
+# Exactly as Auth0 issues it — the trailing slash is required.
+jwt_issuer   = "https://dev-tke5iflfv7b6gdca.eu.auth0.com/"
+# The Identifier of the Auth0 API "Lore Server" (not the app's Client ID).
+jwt_audience = ["https://lore.uzunov.me"]
+# Set by the Auth0 Actions in auth0/actions/ from each user's
+# app_metadata.lore_permissions (works on the Auth0 Free plan, no roles).
+permission_claim = "lore_permissions"
+# Default is ["write"] for every token holder. Empty = a logged-in user with
+# no lore_permissions gets read only.
+implicit_actions = []
+# `lore repository list` source. Default "denied" lists NOTHING, even to
+# admins. "reachable" lists every repository to any signed-in user (they all
+# have read anyway). Listing only; it never grants access to contents.
+baseline_access = "reachable"
+
+[server.auth.oidc]
+# Client ID of the Auth0 Native application `lore login` signs in with.
+client_id = "d47zg7pidwjME1Vr6btZaAj7u58NLaJj"
+scopes    = ["openid", "profile", "offline_access"]
