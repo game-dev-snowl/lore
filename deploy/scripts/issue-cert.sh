@@ -16,7 +16,9 @@ set -a; . "$LORE_DIR/.env"; set +a
 
 : "${LORE_DOMAIN:?set LORE_DOMAIN in .env}"
 : "${LETSENCRYPT_EMAIL:?set LETSENCRYPT_EMAIL in .env}"
-[[ "$LORE_DOMAIN" != "lore.example.com" ]] || { echo "Edit LORE_DOMAIN in .env first." >&2; exit 1; }
+[[ "$LORE_DOMAIN" != "lore.example.com" && "$LORE_DOMAIN" != "lore.lan" ]] || { echo "Set LORE_DOMAIN in .env to a public DNS name first." >&2; exit 1; }
+# 41339 is plain HTTP; on a public host it stays on loopback.
+[[ "${LORE_HTTP_BIND_ADDR:-127.0.0.1}" == "127.0.0.1" ]] || { echo "Public mode: delete LORE_HTTP_BIND_ADDR from .env (41339 is plain HTTP)." >&2; exit 1; }
 
 HOOK="$LORE_DIR/scripts/certbot-deploy-hook.sh"
 chmod +x "$HOOK"

@@ -2,11 +2,11 @@
 
 This runbook is for running Lore on the home server (Ubuntu Server, RAID 1), reachable only from the local network. Let's Encrypt can't reach a LAN-only host, so `make-local-ca.sh` creates a small private CA instead. Clients trust that CA once and use `lores://`, so the server certificate is still fully verified.
 
-Replace these example values with yours:
+These are the values for this deployment. Change them if yours differ:
 
-| Placeholder | Example | What it is |
+| Value | Meaning | How to find it |
 |---|---|---|
-| `192.168.1.50` | server LAN IP | `ip -4 addr` on the server |
+| `192.168.1.29` | server LAN IP | `ip -4 addr` on the server |
 | `192.168.1.0/24` | LAN subnet | your router's network |
 | `lore.lan` | name clients use | any name your LAN resolves |
 
@@ -18,7 +18,9 @@ Replace these example values with yours:
 
 ## 1. Prepare the host
 
-First copy this folder to the server. Run this **on your machine, from this folder** ([details](DEPLOYMENT.md#0-copy-the-files-to-the-server)):
+To run from a git clone and update with `git pull` instead, follow [GIT-DEPLOY.md](GIT-DEPLOY.md). It replaces steps 1 to 3 and the backup cron line in step 7, then sends you back here for step 4, and uses `/opt/lore/deploy` in place of `/opt/lore`.
+
+Otherwise, copy this folder to the server. Run this **on your machine, from this folder** ([details](DEPLOYMENT.md#0-copy-the-files-to-the-server)):
 
 ```bash
 ssh <user>@<server> 'sudo mkdir -p /opt/lore && sudo chown "$USER": /opt/lore'
@@ -36,7 +38,7 @@ sudo LORE_LAN_CIDR=192.168.1.0/24 ./scripts/setup-server.sh "$USER"
 # log out and back in so the docker group membership applies
 ```
 
-With `LORE_LAN_CIDR` set, the firewall allows 41337 (TCP and UDP) only from your subnet, and port 80 is not opened.
+With `LORE_LAN_CIDR` set, UFW opens 41337 (TCP and UDP) only to your subnet and doesn't open port 80. Docker-published ports bypass UFW, so the bindings in step 2 are what limit exposure.
 
 ## 2. Configure
 
@@ -50,11 +52,12 @@ nano .env
 LORE_DOMAIN=lore.lan
 LORE_VERSION=0.13.0
 LORE_DATA_DIR=/srv/lore/data
-LORE_BIND_ADDR=192.168.1.50
+LORE_BIND_ADDR=192.168.1.29
+LORE_HTTP_BIND_ADDR=192.168.1.29
 RUST_LOG=info
 ```
 
-`LETSENCRYPT_EMAIL` isn't used in LAN mode. Setting `LORE_BIND_ADDR` to the LAN IP means Docker publishes 41337 only on that interface. Docker bypasses UFW, so this binding is what actually limits exposure.
+`LETSENCRYPT_EMAIL` isn't used in LAN mode. Setting `LORE_BIND_ADDR` to the LAN IP means Docker publishes 41337 on that interface only, and `LORE_HTTP_BIND_ADDR` does the same for 41339 (plain HTTP). Docker bypasses UFW, so these bindings are what actually limit exposure. They pick the interface, not who may connect: any host that can route to 192.168.1.29 (another VLAN, a VPN peer, a forwarded router port) reaches both ports. To restrict by source, add `DOCKER-USER` iptables rules.
 
 ## 3. Issue the certificate and start
 
@@ -63,7 +66,7 @@ RUST_LOG=info
 docker compose pull
 docker compose up -d
 docker compose ps                  # wait for "(healthy)"
-curl -i http://127.0.0.1:41339/health_check   # HTTP/1.1 200 OK
+curl -i http://192.168.1.29:41339/health_check   # HTTP/1.1 200 OK
 ```
 
 The server certificate is valid for **825 days**. To renew it, re-run `./scripts/make-local-ca.sh`. It reuses the CA, so clients don't need any changes, and it restarts the server. Put a reminder in your calendar.
@@ -104,8 +107,8 @@ The Lore CLI loads the OS trust store as well as its built-in roots, which is wh
 
 You have three options:
 
-- **Router DNS** (best): add a local record `lore.lan → 192.168.1.50`. Most routers, Pi-hole and AdGuard support this.
-- **Per-client hosts file**: add `192.168.1.50 lore.lan` to `/etc/hosts`. On Windows the file is `C:\Windows\System32\drivers\etc\hosts`.
+- **Router DNS** (best): add a local record `lore.lan → 192.168.1.29`. Most routers, Pi-hole and AdGuard support this.
+- **Per-client hosts file**: add `192.168.1.29 lore.lan` to `/etc/hosts`. On Windows the file is `C:\Windows\System32\drivers\etc\hosts`.
 - **Skip DNS entirely**: use the IP in the URL. The certificate covers it too.
 
 ## 6. Connect
@@ -122,6 +125,14 @@ Check the connection from a client:
 openssl s_client -connect lore.lan:41337 -servername lore.lan -CAfile ~/lore-home-ca.pem </dev/null 2>/dev/null | grep 'Verify return'
 # → Verify return code: 0 (ok)
 ```
+
+Check plain HTTP from a client:
+
+```bash
+curl -i http://lore.lan:41339/health_check   # HTTP/1.1 200 OK
+```
+
+Port 41339 is plain HTTP. The `/v1` routes on it check the same Auth0 token as gRPC, but the token and the file contents it carries are not encrypted, so anyone on the LAN path can read or alter them. Clients use `lores://` on 41337 and don't need 41339. Don't forward 41339 on the router.
 
 Then use Lore:
 
@@ -151,4 +162,5 @@ These are the same as for the public deployment. See [DEPLOYMENT.md](DEPLOYMENT.
 | Container keeps restarting right after a fresh setup | `certs/` is empty. Run `make-local-ca.sh` first. |
 | `hostname mismatch` / `UnknownIssuer` on a client | The CA isn't installed on that client, or the URL host isn't `LORE_DOMAIN` or the IP. |
 | Was working, now refuses connections | The server IP changed. Fix the DHCP reservation, update `.env`, and re-run `make-local-ca.sh`. |
-| Works on the server but not from the LAN | `LORE_LAN_CIDR` is wrong in UFW. Check `sudo ufw status`. |
+| Works on the server but not from the LAN | `LORE_HTTP_BIND_ADDR` is unset (41339 stays on loopback), or the client's network blocks it (Wi-Fi AP/client isolation). Check the published addresses with `docker compose ps`. |
+| `curl http://127.0.0.1:41339` refused on the server | Expected: 41339 is published on `LORE_HTTP_BIND_ADDR`, not loopback. Use the LAN IP. |

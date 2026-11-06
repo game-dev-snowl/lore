@@ -1,7 +1,8 @@
 # Lore Server (https://lore.org) — single-node production deployment.
 #
-#   cp .env.example .env   # set LORE_DOMAIN
-#   ./scripts/issue-cert.sh
+#   cp .env.example .env   # holds the home-LAN values (docs/HOME-LAN.md);
+#                          # public mode: see docs/DEPLOYMENT.md §1
+#   ./scripts/make-local-ca.sh   # LAN; public mode: ./scripts/issue-cert.sh
 #   docker compose up -d
 #
 # See docs/DEPLOYMENT.md for the full procedure.
@@ -28,9 +29,11 @@ services:
       # 41337 carries gRPC over TCP and QUIC over UDP — both are required.
       - "${LORE_BIND_ADDR:-0.0.0.0}:41337:41337/tcp"
       - "${LORE_BIND_ADDR:-0.0.0.0}:41337:41337/udp"
-      # HTTP: health check (+ presigned URLs if ever enabled). Plain HTTP, so
-      # keep it on loopback. Clients do not need it with the default config.
-      - "127.0.0.1:41339:41339/tcp"
+      # HTTP: /health_check and the /v1 routes (+ presigned URLs if ever
+      # enabled). It is PLAIN HTTP: tokens and contents sent to /v1 cross the
+      # network unencrypted. Loopback unless LORE_HTTP_BIND_ADDR names a
+      # trusted interface (LAN or VPN IP). Never 0.0.0.0 on a public host.
+      - "${LORE_HTTP_BIND_ADDR:-127.0.0.1}:41339:41339/tcp"
 
     volumes:
       - ./config/local.toml:/etc/lore/config/local.toml:ro
