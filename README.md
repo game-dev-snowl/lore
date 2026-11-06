@@ -3,7 +3,7 @@
 Docker Compose deployment of [Lore](https://lore.org) (Epic Games' open-source VCS for code + large binary assets): a single `loreserver` node with local storage and a Let's Encrypt TLS certificate.
 
 > [!IMPORTANT]
-> **Auth0 sign-in is on.** `config/local.toml` requires an Auth0 access token from tenant `dev-tke5iflfv7b6gdca.eu.auth0.com` (API `https://lore.uzunov.me`); permissions come from Auth0 roles. Setup, roles and troubleshooting: [docs/AUTH0.md](docs/AUTH0.md). Without the `[server.auth]` table, anyone who can reach port 41337 can list, clone, push and **obliterate** every repository.
+> **Auth0 sign-in is on.** `config/local.toml` requires an Auth0 access token from tenant `dev-tke5iflfv7b6gdca.eu.auth0.com` (API `https://lore.uzunov.me`); permissions come from each user's `app_metadata.lore_permissions` via an Auth0 Action (works on the Free plan). Setup, adding users and troubleshooting: [docs/AUTH0.md](docs/AUTH0.md). Without the `[server.auth]` table, anyone who can reach port 41337 can list, clone, push and **obliterate** every repository.
 
 ## Layout
 
@@ -13,6 +13,7 @@ Docker Compose deployment of [Lore](https://lore.org) (Epic Games' open-source V
 ├── .env.example                # domain, image version, data dir → copy to .env
 ├── config/local.toml           # server overlay: TLS cert paths, stores, logging, (auth)
 ├── certs/                      # populated by certbot hook (git-ignored)
+├── auth0/actions/              # Auth0 Actions that put lore_permissions in tokens
 ├── scripts/
 │   ├── setup-server.sh         # fresh Ubuntu/Debian host → Docker, certbot, UFW, sysctl
 │   ├── issue-cert.sh           # Let's Encrypt cert + renewal hook

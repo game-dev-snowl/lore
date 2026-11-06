@@ -47,11 +47,11 @@ output = "stdout"
 jwt_issuer   = "https://dev-tke5iflfv7b6gdca.eu.auth0.com/"
 # The Identifier of the Auth0 API "Lore Server" (not the app's Client ID).
 jwt_audience = ["https://lore.uzunov.me"]
-# Auth0 RBAC writes the user's role permissions to a top-level "permissions"
-# array: read, write, admin, obliterate.
-permission_claim = "permissions"
+# Set by the Auth0 Actions in auth0/actions/ from each user's
+# app_metadata.lore_permissions (works on the Auth0 Free plan, no roles).
+permission_claim = "lore_permissions"
 # Default is ["write"] for every token holder. Empty = a logged-in user with
-# no Auth0 role gets read only.
+# no lore_permissions gets read only.
 implicit_actions = []
 
 [server.auth.oidc]

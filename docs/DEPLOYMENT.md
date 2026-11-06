@@ -152,7 +152,7 @@ The server logs a warning when free space on the store volume drops below 10 GiB
 
 ## 7. Authentication
 
-The server requires Auth0 sign-in, with permissions from Auth0 roles. `config/local.toml` holds the tenant, API and client ID. Setting up the Auth0 side, adding users and troubleshooting: [AUTH0.md](AUTH0.md). Other OIDC providers (e.g. Keycloak) use the same `[server.auth]` + `[server.auth.oidc]` tables. The fields `jwt_issuer`, `jwt_audience`, `permission_claim`, `resource_claim` and the rest are documented in the [config reference](https://epicgames.github.io/lore/reference/lore-server-config/#authentication).
+The server requires Auth0 sign-in, with permissions from each user's Auth0 `app_metadata` (Free-plan compatible, no Auth0 roles). `config/local.toml` holds the tenant, API and client ID. Setting up the Auth0 side, adding users and troubleshooting: [AUTH0.md](AUTH0.md). Other OIDC providers (e.g. Keycloak) use the same `[server.auth]` + `[server.auth.oidc]` tables. The fields `jwt_issuer`, `jwt_audience`, `permission_claim`, `resource_claim` and the rest are documented in the [config reference](https://epicgames.github.io/lore/reference/lore-server-config/#authentication).
 
 ## References
 
