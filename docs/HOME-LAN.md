@@ -48,7 +48,7 @@ nano .env
 
 ```dotenv
 LORE_DOMAIN=lore.lan
-LORE_VERSION=0.10.1
+LORE_VERSION=0.13.0
 LORE_DATA_DIR=/srv/lore/data
 LORE_BIND_ADDR=192.168.1.50
 RUST_LOG=info

@@ -13,7 +13,7 @@ services:
     # Official image, published by EpicGames from release binaries.
     # Unsuffixed tags are linux/amd64 ONLY. Do not run on Ampere/ARM hosts
     # (e.g. Hetzner CAX) — the arm64 build targets AWS Graviton3+ and SIGILLs elsewhere.
-    image: ghcr.io/epicgames/lore/loreserver:${LORE_VERSION:-0.10.1}
+    image: ghcr.io/epicgames/lore/loreserver:${LORE_VERSION:-0.13.0}
     platform: linux/amd64
     container_name: loreserver
     restart: unless-stopped

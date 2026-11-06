@@ -12,13 +12,16 @@ This repo is configured for:
 | API Identifier (audience) | `https://lore.uzunov.me` |
 | Native app Client ID | `d47zg7pidwjME1Vr6btZaAj7u58NLaJj` |
 
+> [!IMPORTANT]
+> **Lore 0.12 or newer, on both server and CLI** (this repo pins **0.13.0**). Before 0.11 `lore login` can't log in with an OIDC provider and fails with `No authentication configured on server`. Refresh tokens are used from 0.12. Upgrade steps: [Upgrading Lore](#upgrading-lore).
+
 Expect about 15 minutes in the Auth0 dashboard and 5 on the server. Commands below use the server's LAN address `lores://192.168.1.29:41337`. The API Identifier `https://lore.uzunov.me` is only a label inside the token. It doesn't need DNS and is **not** the server address.
 
 ## How it works
 
 ```
-lore login ──browser──► Auth0 (Native app) ──► Post Login Action: app_metadata.lore_permissions
-                                                  └─► access token (JWT) with "lore_permissions" claim
+lore login ──device code (RFC 8628)──► Auth0 (Native app) ──► Post Login Action
+                                       └─► access token (JWT) with "lore_permissions" + "root_domains"
 lore CLI ──lores://…:41337 + token──► loreserver
 loreserver: check signature (Auth0 JWKS), iss, aud ─► read "lore_permissions" ─► allow/deny
 ```
@@ -30,6 +33,8 @@ loreserver: check signature (Auth0 JWKS), iss, aud ─► read "lore_permissions
 | `{"lore_permissions": ["read", "write", "admin", "obliterate"]}` | everything, including admin RPCs and obliterate |
 
 Other valid values: `owner`, `migrate`, `push-protected`, `presign`. Anything else is dropped by the Action.
+
+The Action also sets `root_domains` to the hosts clients connect to (`192.168.1.29`, `lore.uzunov.me`). The CLI only sends a token to a server whose host is in `root_domains`, or, without that claim, the host of the token's `https` audience. Since you connect by IP, the audience alone (`lore.uzunov.me`) isn't enough. If you add a hostname or change the IP, update `LORE_HOSTS` in the Action.
 
 Lore always gives a valid token `read`. `implicit_actions = []` in `config/local.toml` stops it from also giving everyone `write` (the default).
 
@@ -44,7 +49,10 @@ Auth0 dashboard → **Applications → APIs → Create API**
 | JWT Profile | Auth0 |
 | Signing Algorithm | RS256 |
 
-Then **Settings → Access Settings**: turn on **Allow Offline Access** (refresh tokens, so users don't sign in every day). Save.
+Then:
+
+1. **Settings → Access Settings**: turn on **Allow Offline Access** (refresh tokens, so users don't sign in every day). Save.
+2. **Application Access** tab (after creating the app in step 2): authorize `Lore CLI` for **user access**. Alternatively, set the API's user-access policy to allow all applications. Skip this and login fails with `Client "…" is not authorized to access resource server "https://lore.uzunov.me"`.
 
 RBAC settings and the API's Permissions tab are **not** used. Leave them off.
 
@@ -52,9 +60,9 @@ RBAC settings and the API's Permissions tab are **not** used. Leave them off.
 
 **Applications → Applications → Create Application → Native**. Name it `Lore CLI`.
 
-1. **Settings → Advanced Settings → Grant Types**: tick **Authorization Code**, **Refresh Token**, **Device Code**. Save.
+1. **Settings → Advanced Settings → Grant Types**: tick **Device Code** and **Refresh Token**. Save. `lore login` uses the device flow, so no callback URLs are needed.
 2. Copy the **Client ID**. It goes into `config/local.toml`.
-3. Leave **Allowed Callback URLs** empty for now. Step 7 fills it in.
+3. Go back to step 1.2 and authorize this app on the API.
 
 ## 3. Set the tenant's default audience
 
@@ -106,17 +114,17 @@ docker compose logs --since 2m loreserver | grep -iE 'jwks|oidc|authorizer|Auth:
 
 Expect `Resolved jwks_uri through OIDC discovery`, `Repository authorizer: GlobalGrantsAuthorizer` and `Starting Lore GRPC Server: 0.0.0.0:41337, Auth: enabled`. The startup warning `No JWT verifier - Admin Service RPCs including obliterate will be unauthenticated` must be **gone**. The server fetches Auth0's signing keys over HTTPS, so it needs outbound internet access (LAN mode included).
 
-## 7. First login (and the callback URL)
+## 7. First login
 
-On your machine:
+On your machine (`lore --version` must be 0.12 or newer):
 
 ```bash
 lore login lores://192.168.1.29:41337
 ```
 
-- **The browser opens and you get a token:** done, go to step 8.
-- **Auth0 shows "Callback URL mismatch":** the error page (or the browser's address bar) contains `redirect_uri=…`. URL-decode it, add it exactly to the Native app's **Allowed Callback URLs**, save, and log in again.
-- **The redirect port changes every time:** Auth0 needs an exact callback URL. Use `lore login --no-browser lores://192.168.1.29:41337` instead, which doesn't need a callback.
+The CLI opens an Auth0 page showing a short code. Check that it matches the code in the terminal, confirm, and sign in. The terminal then finishes by itself. With `--no-browser` it prints the URL and code for you to open on any device.
+
+Tokens refresh automatically. Run `lore login` again only after you change your `app_metadata`, or when you want the change to apply right away.
 
 ## 8. Verify
 
@@ -136,6 +144,9 @@ lore repository list lores://192.168.1.29:41337    # must fail with an auth erro
 
 | Symptom | Likely cause |
 |---|---|
+| `No authentication configured on server` from `lore login` | The CLI or server is older than 0.11 and can't do OIDC login. Upgrade both ([below](#upgrading-lore)). |
+| `Client "…" is not authorized to access resource server "https://lore.uzunov.me"` | Step 1.2 was skipped: authorize `Lore CLI` for user access on the API's **Application Access** tab. |
+| `JWT names no domain it may be sent to` / token not sent to the server | The token has no `root_domains` covering the host you connect to. Check the Action is deployed and `LORE_HOSTS` lists that host or IP. |
 | Every call is rejected and the server logs mention `iss` / issuer | `jwt_issuer` is missing the trailing `/`, or uses a custom domain the token doesn't use. It must match the token's `iss` exactly. |
 | Rejected and the logs mention `aud` / audience | `jwt_audience` doesn't match the API Identifier, or step 3 was skipped. |
 | Token isn't a JWT (no two dots) / "invalid token" | No audience was sent, so Auth0 issued an opaque token. Do step 3. |
@@ -155,6 +166,8 @@ echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '{iss, a
 
 Free plan: 1,000 machine-to-machine tokens per month.
 
+> Not verified: Lore 0.11's release notes say the CLI didn't implement the client-credentials grant yet. Check `lore login --help` on your CLI version for `--client-id` before setting this up.
+
 1. **Applications → Create Application → Machine to Machine**, authorize it for `Lore Server`.
 2. On that app: **Settings → Advanced Settings → Application Metadata**: key `lore_permissions`, value `read,write` (a comma-separated string; app metadata values can't be lists).
 3. **Actions → Library → Create Action**: name `Lore permissions (M2M)`, trigger **Machine to Machine / Credentials Exchange**, code from [`auth0/actions/lore-permissions-m2m.js`](../auth0/actions/lore-permissions-m2m.js). Deploy, then add it under **Actions → Triggers → credentials-exchange**.
@@ -171,3 +184,22 @@ Keep the secret in the CI secret store, never on the command line.
 - Lore server config, Authentication: https://epicgames.github.io/lore/reference/lore-server-config/#authentication
 - Auth0 Actions, post-login `api.accessToken.setCustomClaim`: https://auth0.com/docs/customize/actions/explore-triggers/signup-and-login-triggers/login-trigger/post-login-api-object
 - Auth0 pricing (Role Management not on Free): https://auth0.com/pricing
+
+## Upgrading Lore
+
+Server (on the server; take a backup first, since store formats can change between 0.x releases):
+
+```bash
+cd /opt/lore
+sudo ./scripts/backup.sh
+sed -i 's/^LORE_VERSION=.*/LORE_VERSION=0.13.0/' .env
+docker compose pull && docker compose up -d
+docker compose ps        # healthy
+```
+
+CLI (on every client):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/EpicGames/lore/main/scripts/install.sh | bash
+lore --version
+```

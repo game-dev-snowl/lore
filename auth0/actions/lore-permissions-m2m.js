@@ -11,12 +11,16 @@
  * (application metadata values are strings, so comma-separated).
  */
 const LORE_API = 'https://lore.uzunov.me';
+// Hosts the CLI may send this token to; see lore-permissions-login.js.
+const LORE_HOSTS = ['192.168.1.29', 'lore.uzunov.me'];
 const VALID = new Set([
   'read', 'write', 'owner', 'admin', 'migrate', 'push-protected', 'obliterate', 'presign',
 ]);
 
 exports.onExecuteCredentialsExchange = async (event, api) => {
   if (event.resource_server?.identifier !== LORE_API) return;
+
+  api.accessToken.setCustomClaim('root_domains', LORE_HOSTS);
 
   const raw = event.client.metadata?.lore_permissions;
   if (typeof raw !== 'string') return;
