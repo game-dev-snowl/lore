@@ -34,7 +34,7 @@ Docker Compose deployment of [Lore](https://lore.org) (Epic Games' open-source V
 
 ## Quick start: public mode
 
-This folder isn't in a git remote. Copy it to the server from your machine ([details](docs/DEPLOYMENT.md#0-copy-the-files-to-the-server)):
+This folder is `deploy/` in [game-dev-snowl/lore](https://github.com/game-dev-snowl/lore), a fork of EpicGames/lore. Copy it to the server from your machine, running rsync **from inside `deploy/`** ([details](docs/DEPLOYMENT.md#0-copy-the-files-to-the-server)):
 
 ```bash
 ssh <user>@<server> 'sudo mkdir -p /opt/lore && sudo chown "$USER": /opt/lore'
