@@ -12,7 +12,7 @@ This repo is configured for:
 | API Identifier (audience) | `https://lore.uzunov.me` |
 | Native app Client ID | `d47zg7pidwjME1Vr6btZaAj7u58NLaJj` |
 
-Expect about 15 minutes in the Auth0 dashboard and 5 on the server. Commands below use `lores://lore.uzunov.me:41337`; replace it with your server URL if that's different.
+Expect about 15 minutes in the Auth0 dashboard and 5 on the server. Commands below use the server's LAN address `lores://192.168.1.29:41337`. The API Identifier `https://lore.uzunov.me` is only a label inside the token. It doesn't need DNS and is **not** the server address.
 
 ## How it works
 
@@ -111,25 +111,25 @@ Expect `Resolved jwks_uri through OIDC discovery`, `Repository authorizer: Globa
 On your machine:
 
 ```bash
-lore login lores://lore.uzunov.me:41337
+lore login lores://192.168.1.29:41337
 ```
 
 - **The browser opens and you get a token:** done, go to step 8.
 - **Auth0 shows "Callback URL mismatch":** the error page (or the browser's address bar) contains `redirect_uri=…`. URL-decode it, add it exactly to the Native app's **Allowed Callback URLs**, save, and log in again.
-- **The redirect port changes every time:** Auth0 needs an exact callback URL. Use `lore login --no-browser lores://lore.uzunov.me:41337` instead, which doesn't need a callback.
+- **The redirect port changes every time:** Auth0 needs an exact callback URL. Use `lore login --no-browser lores://192.168.1.29:41337` instead, which doesn't need a callback.
 
 ## 8. Verify
 
 ```bash
 lore auth info                                                  # signed-in identity
-lore repository list lores://lore.uzunov.me:41337               # works for any signed-in user
-lore repository create lores://lore.uzunov.me:41337/auth-test   # needs write
+lore repository list lores://192.168.1.29:41337               # works for any signed-in user
+lore repository create lores://192.168.1.29:41337/auth-test   # needs write
 ```
 
 Then check that anonymous access is blocked, from a machine that has never logged in (or after `lore auth logout`):
 
 ```bash
-lore repository list lores://lore.uzunov.me:41337    # must fail with an auth error
+lore repository list lores://192.168.1.29:41337    # must fail with an auth error
 ```
 
 ## Troubleshooting
@@ -161,7 +161,7 @@ Free plan: 1,000 machine-to-machine tokens per month.
 4. Log in on the CI machine:
 
 ```bash
-LORE_CLIENT_SECRET=… lore login --client-id <M2M_CLIENT_ID> lores://lore.uzunov.me:41337
+LORE_CLIENT_SECRET=… lore login --client-id <M2M_CLIENT_ID> lores://192.168.1.29:41337
 ```
 
 Keep the secret in the CI secret store, never on the command line.
