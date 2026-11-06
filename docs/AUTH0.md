@@ -130,11 +130,11 @@ Tokens refresh automatically. Run `lore login` again only after you change your 
 
 ```bash
 lore auth info                                                  # signed-in identity
-lore repository list lores://192.168.1.29:41337               # works for any signed-in user
+lore repository list lores://192.168.1.29:41337               # lists all repositories (any signed-in user)
 lore repository create lores://192.168.1.29:41337/auth-test   # needs write
 ```
 
-Then check that anonymous access is blocked, from a machine that has never logged in (or after `lore auth logout`):
+Then check that anonymous access is blocked. While you're logged in this command succeeds, so log out first (`lore auth logout`, then `lore login` again afterwards) or use a machine that has never logged in:
 
 ```bash
 lore repository list lores://192.168.1.29:41337    # must fail with an auth error
@@ -147,6 +147,7 @@ lore repository list lores://192.168.1.29:41337    # must fail with an auth erro
 | `No authentication configured on server` from `lore login` | The CLI or server is older than 0.11 and can't do OIDC login. Upgrade both ([below](#upgrading-lore)). |
 | `Client "…" is not authorized to access resource server "https://lore.uzunov.me"` | Step 1.2 was skipped: authorize `Lore CLI` for user access on the API's **Application Access** tab. |
 | `JWT names no domain it may be sent to` / token not sent to the server | The token has no `root_domains` covering the host you connect to. Check the Action is deployed and `LORE_HOSTS` lists that host or IP. |
+| `lore repository list` prints nothing although repositories exist | `baseline_access` is the default `denied`, which lists no IDs to anyone. `config/local.toml` sets `"reachable"`. The startup log should show `BaselineRepositoryCatalog(reachable)`. |
 | Every call is rejected and the server logs mention `iss` / issuer | `jwt_issuer` is missing the trailing `/`, or uses a custom domain the token doesn't use. It must match the token's `iss` exactly. |
 | Rejected and the logs mention `aud` / audience | `jwt_audience` doesn't match the API Identifier, or step 3 was skipped. |
 | Token isn't a JWT (no two dots) / "invalid token" | No audience was sent, so Auth0 issued an opaque token. Do step 3. |

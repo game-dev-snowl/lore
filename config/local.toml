@@ -53,6 +53,10 @@ permission_claim = "lore_permissions"
 # Default is ["write"] for every token holder. Empty = a logged-in user with
 # no lore_permissions gets read only.
 implicit_actions = []
+# `lore repository list` source. Default "denied" lists NOTHING, even to
+# admins. "reachable" lists every repository to any signed-in user (they all
+# have read anyway). Listing only; it never grants access to contents.
+baseline_access = "reachable"
 
 [server.auth.oidc]
 # Client ID of the Auth0 Native application `lore login` signs in with.
