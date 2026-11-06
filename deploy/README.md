@@ -48,7 +48,7 @@ Then on the server:
 ```bash
 cd /opt/lore
 sudo ./scripts/setup-server.sh "$USER"
-cp .env.example .env && nano .env          # LORE_DOMAIN, LETSENCRYPT_EMAIL
+cp .env.example .env && nano .env          # LORE_DOMAIN, LETSENCRYPT_EMAIL, LORE_BIND_ADDR=0.0.0.0; delete LORE_HTTP_BIND_ADDR
 sudo ./scripts/issue-cert.sh
 docker compose up -d
 curl -i http://127.0.0.1:41339/health_check   # → HTTP/1.1 200 OK
@@ -64,9 +64,9 @@ lore repository create lores://lore.example.com:41337/my-project
 
 | Port  | Proto | Purpose | Exposed |
 |-------|-------|---------|---------|
-| 41337 | TCP   | gRPC (TLS) | public |
-| 41337 | UDP   | QUIC (TLS) | public |
-| 41339 | TCP   | HTTP health check | 127.0.0.1 only |
-| 80    | TCP   | certbot HTTP-01 (only during issue/renew) | public |
+| 41337 | TCP   | gRPC (TLS) | `LORE_BIND_ADDR` (public, or LAN IP in LAN mode) |
+| 41337 | UDP   | QUIC (TLS) | `LORE_BIND_ADDR` (public, or LAN IP in LAN mode) |
+| 41339 | TCP   | HTTP (plain): health check, `/v1` routes | `LORE_HTTP_BIND_ADDR` (default 127.0.0.1; LAN IP in LAN mode) |
+| 80    | TCP   | certbot HTTP-01 (only during issue/renew) | public mode only |
 
 The full procedure is in [docs/LINUX-SETUP.md](docs/LINUX-SETUP.md), then [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).

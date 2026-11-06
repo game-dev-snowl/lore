@@ -58,6 +58,7 @@ nano .env
 | `LORE_VERSION` | the pinned image tag. Check the [releases](https://github.com/EpicGames/lore/releases) page |
 | `LORE_DATA_DIR` | `/srv/lore/data` (absolute path, on the data volume) |
 | `LORE_BIND_ADDR` | `0.0.0.0` to publish publicly, or a VPN IP to keep it private |
+| `LORE_HTTP_BIND_ADDR` | delete it (defaults to `127.0.0.1`). 41339 is plain HTTP; never publish it on `0.0.0.0` here |
 
 ## 2. Get the TLS certificate
 
