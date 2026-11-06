@@ -32,10 +32,21 @@ Docker Compose deployment of [Lore](https://lore.org) (Epic Games' open-source V
 | **LAN-only** (home server) | private CA (`scripts/make-local-ca.sh`) | [docs/HOME-LAN.md](docs/HOME-LAN.md) |
 | **Public** (VPS / datacenter) | Let's Encrypt (`scripts/issue-cert.sh`) | [docs/LINUX-SETUP.md](docs/LINUX-SETUP.md) → [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
 
-## Quick start: public mode (on the server)
+## Quick start: public mode
+
+This folder isn't in a git remote. Copy it to the server from your machine ([details](docs/DEPLOYMENT.md#0-copy-the-files-to-the-server)):
 
 ```bash
-git clone <this-repo> /opt/lore && cd /opt/lore
+ssh <user>@<server> 'sudo mkdir -p /opt/lore && sudo chown "$USER": /opt/lore'
+rsync -av --exclude .git --exclude .claude --exclude .env --exclude 'certs/*.pem' \
+  --exclude ca/ --exclude data/ --exclude backups/ --exclude .DS_Store \
+  ./ <user>@<server>:/opt/lore/
+```
+
+Then on the server:
+
+```bash
+cd /opt/lore
 sudo ./scripts/setup-server.sh "$USER"
 cp .env.example .env && nano .env          # LORE_DOMAIN, LETSENCRYPT_EMAIL
 sudo ./scripts/issue-cert.sh

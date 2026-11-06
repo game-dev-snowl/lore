@@ -48,10 +48,18 @@ From a **second terminal**: `ssh deploy@SERVER_IP` must work before you close th
 
 ## 4. Run the setup script
 
+First copy this folder to the server. Run this **on your machine, from this folder** ([details](DEPLOYMENT.md#0-copy-the-files-to-the-server)):
+
 ```bash
-sudo apt-get update && sudo apt-get install -y git
-sudo git clone <your-repo-url> /opt/lore
-sudo chown -R deploy:deploy /opt/lore
+ssh deploy@<server> 'sudo mkdir -p /opt/lore && sudo chown deploy: /opt/lore'
+rsync -av --exclude .git --exclude .claude --exclude .env --exclude 'certs/*.pem' \
+  --exclude ca/ --exclude data/ --exclude backups/ --exclude .DS_Store \
+  ./ deploy@<server>:/opt/lore/
+```
+
+Then on the server:
+
+```bash
 cd /opt/lore
 sudo ./scripts/setup-server.sh deploy
 exit   # log out and back in so the docker group membership applies

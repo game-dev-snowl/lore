@@ -96,8 +96,10 @@ A change reaches the user on their next token refresh, or right away if they run
 
 `config/local.toml` already has the block enabled with the values at the top of this page. For a different tenant, change `jwt_issuer` (keep `https://` and the trailing `/`), `jwt_audience` and `client_id`.
 
+Copy the updated `config/local.toml` to the server first ([how](DEPLOYMENT.md#0-copy-the-files-to-the-server)), then on the server:
+
 ```bash
-cd /opt/lore && git pull
+cd /opt/lore
 docker compose restart loreserver
 docker compose logs --since 2m loreserver | grep -iE 'jwks|oidc|authorizer|Auth:|error'
 ```

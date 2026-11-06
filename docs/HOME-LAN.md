@@ -18,10 +18,18 @@ Replace these example values with yours:
 
 ## 1. Prepare the host
 
+First copy this folder to the server. Run this **on your machine, from this folder** ([details](DEPLOYMENT.md#0-copy-the-files-to-the-server)):
+
 ```bash
-sudo apt-get update && sudo apt-get install -y git
-sudo git clone <your-repo-url> /opt/lore
-sudo chown -R "$USER":"$USER" /opt/lore
+ssh <user>@<server> 'sudo mkdir -p /opt/lore && sudo chown "$USER": /opt/lore'
+rsync -av --exclude .git --exclude .claude --exclude .env --exclude 'certs/*.pem' \
+  --exclude ca/ --exclude data/ --exclude backups/ --exclude .DS_Store \
+  ./ <user>@<server>:/opt/lore/
+```
+
+Then on the server:
+
+```bash
 cd /opt/lore
 
 sudo LORE_LAN_CIDR=192.168.1.0/24 ./scripts/setup-server.sh "$USER"

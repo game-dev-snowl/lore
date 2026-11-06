@@ -17,6 +17,30 @@ Config layering inside the image: compiled-in defaults → `/etc/lore/config/def
 
 **`lores://` vs `lore://`.** The CLI only verifies the server certificate when the URL scheme ends in `s`. With `lores://` it checks QUIC and gRPC against the OS trust store, which is why both endpoints have the Let's Encrypt cert. With `lore://` the connection is still encrypted, but the server is never verified, so it is open to MITM. Always use `lores://` with this setup.
 
+## 0. Copy the files to the server
+
+This folder isn't in a git remote. It lives on your machine and is copied to `/opt/lore` on the server with `rsync`.
+
+Once, create the folder on the server:
+
+```bash
+ssh <user>@<server> 'sudo mkdir -p /opt/lore && sudo chown "$USER": /opt/lore'
+```
+
+Every time you change something here (config, docs, scripts), run this **on your machine, from this folder**:
+
+```bash
+rsync -av --exclude .git --exclude .claude --exclude .env --exclude 'certs/*.pem' \
+  --exclude ca/ --exclude data/ --exclude backups/ --exclude .DS_Store \
+  ./ <user>@<server>:/opt/lore/
+```
+
+- It never copies `.env`, `certs/*.pem`, `ca/`, `data/` or `backups/`. Those exist only on the server, so a copy can't overwrite them.
+- It doesn't delete anything on the server. If you remove a file here, remove it from `/opt/lore` by hand too.
+- `-a` keeps the scripts executable.
+
+Then apply it on the server: `docker compose restart loreserver` after a `config/local.toml` change, or `docker compose up -d` after a `docker-compose.yml` change.
+
 ## 1. Configure
 
 ```bash
@@ -91,8 +115,8 @@ Always give the port explicitly. Without it, `lores://` defaults gRPC to **443**
 ### Upgrade the server
 
 ```bash
+# copy any changes from your machine first (section 0), then on the server:
 cd /opt/lore
-git pull
 nano .env                 # bump LORE_VERSION (read the release notes first: config keys do change)
 docker compose pull
 docker compose up -d      # recreates the container; ~5-30 s downtime
@@ -125,7 +149,7 @@ docker compose start loreserver
 
 ### Configuration changes
 
-Edit `config/local.toml`, commit, pull on the server, then `docker compose restart loreserver`. Single scalar values can also be set as env vars in `docker-compose.yml`, e.g. `LORE__SERVER__HTTP__STORE_HEALTH_CHECK: "true"`.
+Edit `config/local.toml` on your machine, copy it over (section 0), then run `docker compose restart loreserver` on the server. Single scalar values can also be set as env vars in `docker-compose.yml`, e.g. `LORE__SERVER__HTTP__STORE_HEALTH_CHECK: "true"`.
 
 ### Useful commands
 
