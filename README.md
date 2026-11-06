@@ -2,8 +2,8 @@
 
 Docker Compose deployment of [Lore](https://lore.org) (Epic Games' open-source VCS for code + large binary assets): a single `loreserver` node with local storage and a Let's Encrypt TLS certificate.
 
-> [!WARNING]
-> **There is no authentication by default.** With no `[server.auth]` in `config/local.toml`, anyone who can reach port 41337 can list, clone and push every repository. They can also call admin RPCs, including **obliterate**: the server logs `No JWT verifier - Admin Service RPCs including obliterate will be unauthenticated` at startup. To keep it private, set `LORE_BIND_ADDR` to a VPN or Tailscale IP, or enable Auth0 sign-in with role-based permissions: [docs/AUTH0.md](docs/AUTH0.md).
+> [!IMPORTANT]
+> **Auth0 sign-in is on.** `config/local.toml` requires an Auth0 access token from tenant `dev-tke5iflfv7b6gdca.eu.auth0.com` (API `https://lore.uzunov.me`); permissions come from Auth0 roles. Setup, roles and troubleshooting: [docs/AUTH0.md](docs/AUTH0.md). Without the `[server.auth]` table, anyone who can reach port 41337 can list, clone, push and **obliterate** every repository.
 
 ## Layout
 

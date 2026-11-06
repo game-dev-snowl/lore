@@ -64,7 +64,7 @@ Permission changes reach a user on their next token, so after changing roles the
 
 ## 5. Turn it on in the server
 
-On the server, edit `config/local.toml`. Uncomment the Auth0 block and fill in:
+`config/local.toml` in this repo already has the block enabled for tenant `dev-tke5iflfv7b6gdca.eu.auth0.com`. For a different tenant, change these values:
 
 | Placeholder | Value |
 |---|---|

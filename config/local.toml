@@ -35,27 +35,26 @@ flush_delay_seconds = 10
 format = "json"
 output = "stdout"
 
-# --- Authentication: Auth0 (DISABLED until you uncomment) -------------------
-# With no [server.auth] table the server accepts UNAUTHENTICATED requests:
-# anyone who can reach port 41337 can list, clone and push every repository.
-#
-# To enable Auth0, follow docs/AUTH0.md, then uncomment the block below and
-# replace the three <...> values. The server needs outbound HTTPS to your
-# tenant to fetch its signing keys (OIDC discovery on jwt_issuer).
-#
-# [server.auth]
-# # Exactly as Auth0 issues it — the trailing slash is required.
-# jwt_issuer   = "https://<TENANT>.auth0.com/"
-# # The Identifier of the Auth0 API you created (not the app's Client ID).
-# jwt_audience = ["<API_IDENTIFIER>"]
-# # Auth0 RBAC writes the user's role permissions to a top-level "permissions"
-# # array: read, write, admin, obliterate.
-# permission_claim = "permissions"
-# # Default is ["write"] for every token holder. Empty = a logged-in user with
-# # no Auth0 role gets read only.
-# implicit_actions = []
-#
-# [server.auth.oidc]
-# # Client ID of the Auth0 Native application `lore login` signs in with.
-# client_id = "<NATIVE_APP_CLIENT_ID>"
-# scopes    = ["openid", "profile", "offline_access"]
+# --- Authentication: Auth0 (ENABLED) -----------------------------------------
+# Setup and troubleshooting: docs/AUTH0.md. Removing the [server.auth] table
+# makes the server accept UNAUTHENTICATED requests again: anyone who can reach
+# port 41337 could list, clone, push and obliterate every repository.
+# The server needs outbound HTTPS to the tenant to fetch its signing keys
+# (OIDC discovery on jwt_issuer); if it can't, it refuses to start.
+
+[server.auth]
+# Exactly as Auth0 issues it — the trailing slash is required.
+jwt_issuer   = "https://dev-tke5iflfv7b6gdca.eu.auth0.com/"
+# The Identifier of the Auth0 API "Lore Server" (not the app's Client ID).
+jwt_audience = ["https://lore.uzunov.me"]
+# Auth0 RBAC writes the user's role permissions to a top-level "permissions"
+# array: read, write, admin, obliterate.
+permission_claim = "permissions"
+# Default is ["write"] for every token holder. Empty = a logged-in user with
+# no Auth0 role gets read only.
+implicit_actions = []
+
+[server.auth.oidc]
+# Client ID of the Auth0 Native application `lore login` signs in with.
+client_id = "d47zg7pidwjME1Vr6btZaAj7u58NLaJj"
+scopes    = ["openid", "profile", "offline_access"]
