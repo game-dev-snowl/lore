@@ -18,7 +18,9 @@ These are the values for this deployment. Change them if yours differ:
 
 ## 1. Prepare the host
 
-First copy this folder to the server. Run this **on your machine, from this folder** ([details](DEPLOYMENT.md#0-copy-the-files-to-the-server)):
+To run from a git clone and update with `git pull` instead, follow [GIT-DEPLOY.md](GIT-DEPLOY.md), which replaces this step and uses `/opt/lore/deploy` in place of `/opt/lore`.
+
+Otherwise, copy this folder to the server. Run this **on your machine, from this folder** ([details](DEPLOYMENT.md#0-copy-the-files-to-the-server)):
 
 ```bash
 ssh <user>@<server> 'sudo mkdir -p /opt/lore && sudo chown "$USER": /opt/lore'

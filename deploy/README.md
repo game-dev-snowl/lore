@@ -22,6 +22,7 @@ Docker Compose deployment of [Lore](https://lore.org) (Epic Games' open-source V
 └── docs/
     ├── LINUX-SETUP.md          # provisioning + hardening the host
     ├── DEPLOYMENT.md           # deploy, connect clients, upgrade, backup, troubleshoot
+    ├── GIT-DEPLOY.md           # run from a git clone at /opt/lore (update = git pull)
     └── AUTH0.md                # Auth0 sign-in + role-based permissions
 ```
 
@@ -31,6 +32,9 @@ Docker Compose deployment of [Lore](https://lore.org) (Epic Games' open-source V
 |---|---|---|
 | **LAN-only** (home server) | private CA (`scripts/make-local-ca.sh`) | [docs/HOME-LAN.md](docs/HOME-LAN.md) |
 | **Public** (VPS / datacenter) | Let's Encrypt (`scripts/issue-cert.sh`) | [docs/LINUX-SETUP.md](docs/LINUX-SETUP.md) → [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
+
+> [!TIP]
+> To run the server from a git clone of this repository instead of an rsync copy, and update it with `git pull`, follow [docs/GIT-DEPLOY.md](docs/GIT-DEPLOY.md). It also covers replacing an existing `/opt/lore` copy.
 
 ## Quick start: public mode
 

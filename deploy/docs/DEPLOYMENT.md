@@ -19,6 +19,8 @@ Config layering inside the image: compiled-in defaults → `/etc/lore/config/def
 
 ## 0. Copy the files to the server
 
+Alternative: clone the repository on the server and update with `git pull`, as [GIT-DEPLOY.md](GIT-DEPLOY.md) describes. The deployment then runs from `/opt/lore/deploy`.
+
 This folder is `deploy/` in the fork [game-dev-snowl/lore](https://github.com/game-dev-snowl/lore). Edit it there, commit, push, and copy it to `/opt/lore` on the server with `rsync` run **from inside `deploy/`**. That way only the deployment files go to the server, not Lore's source.
 
 Keeping the fork current with EpicGames/lore: GitHub's **Sync fork** button, or `git fetch upstream && git merge upstream/main` locally. `deploy/` exists only in the fork, so these merges don't conflict with it.
