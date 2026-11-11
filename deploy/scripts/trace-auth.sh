@@ -61,6 +61,46 @@ run() {
   return "$rc"
 }
 
+diagnose() {
+  section "Diagnosis"
+  if [ "${#FINDINGS[@]}" -eq 0 ]; then
+    say "No known cause found. Run --server on the server too, and compare both reports"
+    say "with the table in deploy/docs/AUTH0.md#troubleshooting."
+  else
+    local i=1 f
+    for f in "${FINDINGS[@]}"; do say "$i. $f"; i=$((i + 1)); done
+  fi
+  say ""
+  say "Report: $REPORT"
+  [ "${#FINDINGS[@]}" -eq 0 ] && exit 0
+  exit 1
+}
+
+# Flags stored logins whose `Expires:` time in `lore auth list` has passed. A login past it
+# can no longer be refreshed, so every call that needs a token fails until `lore login`.
+check_auth_list() {
+  run auth-list lore auth list
+  command -v python3 >/dev/null || return 0
+  local expired
+  expired="$(python3 -I -c '
+import sys, time
+from email.utils import parsedate_to_datetime
+n = 0
+for line in open(sys.argv[1]):
+    k, _, v = line.strip().partition(":")
+    if k == "Expires":
+        try:
+            if parsedate_to_datetime(v.strip()).timestamp() < time.time():
+                n += 1
+        except (TypeError, ValueError):
+            pass
+print(n)
+' "$OUT/auth-list.log" 2>/dev/null)"
+  if [ "${expired:-0}" -gt 0 ]; then
+    finding "$expired stored login(s) in 'lore auth list' are past their Expires time, so the CLI can't refresh them and every authenticated call fails. Log in again: lore login ${1:-<lores://server:41337>}"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 if [ "$MODE" = server ]; then
   cd "$DEPLOY_DIR" || exit 1
@@ -121,12 +161,18 @@ else
   run date date -u
 
   section "Client: repository remote"
-  REMOTE="$(lore repository config get remote_url 2>/dev/null | tail -n1)"
+  # pipefail makes the assignment fail when lore does; it prints its error on stdout.
+  REMOTE="$(lore repository config get remote_url 2>/dev/null | tail -n1)" || REMOTE=""
   if [ -z "$REMOTE" ] && [ -f .lore/config.toml ]; then
     REMOTE="$(grep -E '^[[:space:]]*remote_url[[:space:]]*=' .lore/config.toml | head -n1 | sed -E 's/^[^"]*"([^"]*)".*/\1/')"
   fi
   say "remote_url = ${REMOTE:-<none>}"
-  [ -n "$REMOTE" ] || finding "No remote_url here. Run this from the root of the working tree that won't push."
+  if [ -z "$REMOTE" ]; then
+    finding "No remote_url here ($PWD is not a Lore working tree). cd to the root of the working tree that won't push and run this script by its path. The connection, token and push checks were skipped because they need the repository."
+    section "Client: stored identities"
+    check_auth_list
+    diagnose
+  fi
   case "$REMOTE" in lore://*)
     finding "remote_url uses lore://, which sends tokens without TLS. Use lores:// for this server." ;; esac
   SCHEME="${REMOTE%%://*}"
@@ -155,7 +201,7 @@ else
   fi
 
   section "Client: stored identities"
-  run auth-list lore auth list
+  check_auth_list "$SERVER_URL"
   run auth-info lore auth info \
     || finding "'lore auth info' failed: no usable stored login. Run: lore login $SERVER_URL"
 
@@ -249,13 +295,4 @@ for i in issues:
 fi
 
 # ---------------------------------------------------------------------------
-section "Diagnosis"
-if [ "${#FINDINGS[@]}" -eq 0 ]; then
-  say "No known cause found. Run --server on the server too, and compare both reports"
-  say "with the table in deploy/docs/AUTH0.md#troubleshooting."
-else
-  i=1; for f in "${FINDINGS[@]}"; do say "$i. $f"; i=$((i + 1)); done
-fi
-say ""
-say "Report: $REPORT"
-[ "${#FINDINGS[@]}" -eq 0 ]
+diagnose
