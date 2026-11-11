@@ -14,3 +14,116 @@ mod status;
 mod store_config_tests;
 pub(crate) mod test_helpers;
 mod write_token_tests;
+
+use lore_revision::repository::RepositoryConfig;
+use lore_revision::repository::VfsConfig;
+use lore_revision::repository::VfsType;
+
+#[test]
+fn vfs_type_fuse_roundtrips_serde() {
+    let json = serde_json::to_string(&VfsType::Fuse).expect("VfsType::Fuse serializes");
+    let restored: VfsType =
+        serde_json::from_str(&json).expect("VfsType::Fuse round-trips through serde");
+    assert_eq!(restored, VfsType::Fuse);
+}
+
+#[test]
+fn vfs_config_base_time_is_optional_and_absent_by_default() {
+    let config = VfsConfig {
+        vfs_type: VfsType::Fuse,
+        base_time: None,
+    };
+    let json = serde_json::to_string(&config).expect("VfsConfig serializes");
+    assert!(
+        !json.contains("base_time"),
+        "absent base_time must be skipped, got: {json}"
+    );
+    let restored: VfsConfig =
+        serde_json::from_str(&json).expect("VfsConfig without base_time deserializes");
+    assert!(restored.base_time.is_none());
+}
+
+#[test]
+fn repository_config_names_its_vfs_type() {
+    let config = RepositoryConfig {
+        vfs: Some(VfsConfig {
+            vfs_type: VfsType::Fuse,
+            base_time: None,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(config.vfs_type(), VfsType::Fuse);
+    assert!(config.vfs_type().is_virtual());
+    assert_eq!(
+        RepositoryConfig::default().vfs_type(),
+        VfsType::None,
+        "a config without a [vfs] section names no VFS"
+    );
+}
+
+/// A virtual VFS always uses a shared store: one that inherits the machine's setting gets one,
+/// and one that disables it is refused. Without a VFS the mode is kept as given.
+#[test]
+fn a_virtual_vfs_always_uses_a_shared_store() {
+    use lore_revision::repository::LoreSharedStoreMode;
+
+    for vfs in [VfsType::Fuse, VfsType::Swfs] {
+        for mode in [LoreSharedStoreMode::Inherit, LoreSharedStoreMode::Enabled] {
+            assert_eq!(
+                mode.for_vfs(vfs).expect("a shared store is allowed"),
+                LoreSharedStoreMode::Enabled,
+                "{mode:?} with {vfs}"
+            );
+        }
+        let refusal = LoreSharedStoreMode::Disabled
+            .for_vfs(vfs)
+            .expect_err("a virtual clone without a shared store is refused");
+        assert!(
+            refusal.reason.contains("always uses a shared store"),
+            "{}",
+            refusal.reason
+        );
+    }
+    for mode in [
+        LoreSharedStoreMode::Inherit,
+        LoreSharedStoreMode::Enabled,
+        LoreSharedStoreMode::Disabled,
+    ] {
+        assert_eq!(
+            mode.for_vfs(VfsType::None).expect("no VFS keeps the mode"),
+            mode
+        );
+    }
+}
+
+/// A config with a virtual VFS and no shared store fails to validate, as the instance could not
+/// be found or served.
+#[test]
+fn a_virtual_vfs_without_a_shared_store_fails_to_validate() {
+    use lore_revision::repository::SharedStoreToUseConfig;
+
+    for vfs_type in [VfsType::Fuse, VfsType::Swfs] {
+        let vfs = Some(VfsConfig {
+            vfs_type,
+            base_time: None,
+        });
+        let without = RepositoryConfig {
+            vfs: vfs.clone(),
+            ..Default::default()
+        };
+        assert!(
+            without.validate().is_err(),
+            "{vfs_type} without a shared store"
+        );
+        let with = RepositoryConfig {
+            vfs,
+            shared_store_to_use: Some(SharedStoreToUseConfig {
+                use_shared_store: Some(true),
+                shared_store_path: None,
+            }),
+            ..Default::default()
+        };
+        assert!(with.validate().is_ok(), "{vfs_type} with a shared store");
+    }
+    assert!(RepositoryConfig::default().validate().is_ok());
+}

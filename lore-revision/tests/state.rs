@@ -1631,6 +1631,39 @@ mod tests {
         })
         .await;
     }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_provider_marks_every_state_it_serves() {
+        with_state(|repository, state| async move {
+            assert!(
+                !state.is_served(),
+                "no State is served before a provider takes it"
+            );
+            let fs = lore_revision::fs::fuse::filesystem::FuseFilesystem::new(
+                repository.clone(),
+                state.clone(),
+                lore_revision::fs::fuse::attr::AttrContext {
+                    uid: 1000,
+                    gid: 1000,
+                    blksize: 1 << 17,
+                    base_time: 1_700_000_000_000,
+                },
+            )
+            .await
+            .expect("provider construction");
+            assert!(fs.state().is_served(), "the State the provider serves");
+            assert!(
+                state.is_served(),
+                "the zero revision is served as the caller's own State"
+            );
+
+            let next = State::new();
+            fs.publish(next.clone(), repository.clone(), None, None);
+            assert!(next.is_served(), "a published State is served");
+        })
+        .await;
+    }
 }
 
 mod single_file_compare_result_tests {
@@ -2959,8 +2992,11 @@ mod block_single_flight {
             self.inner.max_query_batch()
         }
 
-        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-            self.inner.clone().flush(sync_data).await
+        async fn flush(
+            self: Arc<Self>,
+            options: lore_storage::FlushOptions,
+        ) -> Result<(), StoreError> {
+            self.inner.clone().flush(options).await
         }
 
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
@@ -3566,6 +3602,46 @@ mod block_single_flight {
                     "a name table lookup holds {} bytes, its read {}",
                     size_of_val(&name_table),
                     size_of_val(&name_table_read)
+                );
+            })
+            .await;
+    }
+
+    /// A walk that attributes its entries holds the attribution load in a box of its own, so the
+    /// future of each entry, which walks a link's subtree through `enumerate_children`, does not
+    /// hold the delta block read.
+    #[tokio::test]
+    async fn an_attributed_walk_keeps_the_delta_read_out_of_its_future() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (immutable_store, mutable_store, _execution) =
+                    test_store_create().await.expect("Failed to create stores");
+                let repository = Arc::new(RepositoryContext::new_null_context(
+                    immutable_store,
+                    mutable_store,
+                ));
+                let state = State::new();
+                let mut tree_walk = lore_revision::state::TreeWalk::default();
+
+                let walk = lore_revision::state::enumerate_children(
+                    state.clone(),
+                    repository.clone(),
+                    ROOT_NODE,
+                    lore_revision::util::path::RelativePath::new(),
+                    0,
+                    0,
+                    0,
+                    lore_revision::state::allow_all_repositories(),
+                    &mut tree_walk,
+                    true,
+                );
+                let delta_read = state.delta_block(repository);
+
+                assert!(
+                    size_of_val(&walk) < size_of_val(&delta_read),
+                    "an attributed walk holds {} bytes, the delta block read {}",
+                    size_of_val(&walk),
+                    size_of_val(&delta_read)
                 );
             })
             .await;

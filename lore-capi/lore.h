@@ -218,13 +218,36 @@ typedef enum lore_file_audit_outcome_t {
 
 // Phase of an instance delete operation.
 typedef enum lore_repository_instance_delete_phase_t {
-  // Unmounting the SWFS instance
+  // Unmounting the instance, an SWFS instance or a virtual clone
   LORE_REPOSITORY_INSTANCE_DELETE_PHASE_UNMOUNTING = 0,
   // Removing instance keys from mutable store
   LORE_REPOSITORY_INSTANCE_DELETE_PHASE_DEREGISTERING = 1,
   // Deleting external directories or repository directory
   LORE_REPOSITORY_INSTANCE_DELETE_PHASE_DELETING_FILES = 2,
 } lore_repository_instance_delete_phase_t;
+
+// How an instance clone is made, as decided before the clone writes anything.
+typedef enum lore_repository_instance_clone_method_t {
+  // The clone shares the instance's data blocks, costing filesystem metadata, not content
+  LORE_REPOSITORY_INSTANCE_CLONE_METHOD_SHARES_BLOCKS = 0,
+  // The clone copies the instance's files
+  LORE_REPOSITORY_INSTANCE_CLONE_METHOD_COPIES_BYTES = 1,
+  // The instance cannot be cloned to the destination
+  LORE_REPOSITORY_INSTANCE_CLONE_METHOD_UNSUPPORTED = 2,
+} lore_repository_instance_clone_method_t;
+
+// Phase of an instance clone operation.
+typedef enum lore_repository_instance_clone_phase_t {
+  // Removing a directory an interrupted clone to the same destination left, named by the
+  // event's path, before the instance's lock is taken
+  LORE_REPOSITORY_INSTANCE_CLONE_PHASE_REMOVING_LEFTOVER = 0,
+  // Writing the instance's modified-time records back to disk
+  LORE_REPOSITORY_INSTANCE_CLONE_PHASE_WRITING_RECORDS = 1,
+  // Copying the instance's directory, sent again each event interval with the counts so far
+  LORE_REPOSITORY_INSTANCE_CLONE_PHASE_COPYING = 2,
+  // Giving the clone the instance's anchors, moving it to its path and registering it
+  LORE_REPOSITORY_INSTANCE_CLONE_PHASE_REGISTERING = 3,
+} lore_repository_instance_clone_phase_t;
 
 // Which authentication path a client takes if a server advertises both its
 // gRPC auth service and an OIDC issuer. A path the server does not
@@ -250,6 +273,8 @@ typedef enum lore_vfs_type_t {
   LORE_VFS_TYPE_DEFAULT = 1,
   // Use SWFS as a VFS
   LORE_VFS_TYPE_SWFS = 2,
+  // Use a Linux FUSE mount served by the Lore service as a VFS
+  LORE_VFS_TYPE_FUSE = 3,
 } lore_vfs_type_t;
 
 // Whether a repository being created or cloned should be backed by a shared store.
@@ -1149,6 +1174,10 @@ typedef struct lore_branch_push_event_data_t {
 
 // Data for the event sent before a revision's parent is rewritten during push.
 typedef struct lore_branch_push_revision_update_begin_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The revision being updated.
   struct lore_hash_t revision;
   // The previous parent revision.
@@ -1159,12 +1188,20 @@ typedef struct lore_branch_push_revision_update_begin_event_data_t {
 
 // Data for the event sent after a revision's parent is rewritten during push.
 typedef struct lore_branch_push_revision_update_end_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The updated revision.
   struct lore_hash_t revision;
 } lore_branch_push_revision_update_end_event_data_t;
 
 // Data for the event sent before fragments are transferred during push.
 typedef struct lore_branch_push_fragment_begin_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The number of fragments to transfer.
   uint64_t fragments;
   // The total number of bytes to transfer.
@@ -1173,6 +1210,10 @@ typedef struct lore_branch_push_fragment_begin_event_data_t {
 
 // Data for the event sent as fragments are transferred during push.
 typedef struct lore_branch_push_fragment_progress_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The number of fragments transferred so far.
   uint64_t complete;
   // The total number of fragments to transfer.
@@ -1185,6 +1226,10 @@ typedef struct lore_branch_push_fragment_progress_event_data_t {
 
 // Data for the event sent after fragments are transferred during push.
 typedef struct lore_branch_push_fragment_end_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The number of fragments transferred.
   uint64_t fragments;
   // The number of bytes transferred.
@@ -1203,6 +1248,10 @@ typedef struct lore_branch_push_branch_create_begin_event_data_t {
 
 // Data for the event sent after a branch is created on the remote.
 typedef struct lore_branch_push_branch_create_end_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The revision the branch points to on the remote.
   struct lore_hash_t remote_revision;
 } lore_branch_push_branch_create_end_event_data_t;
@@ -1221,6 +1270,10 @@ typedef struct lore_branch_push_revision_push_begin_event_data_t {
 
 // Data for the event sent when the remote assigns a pushed revision a new identity.
 typedef struct lore_branch_push_revision_push_update_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The revision before the remote reassigned it.
   struct lore_hash_t old_revision;
   // The revision the remote assigned.
@@ -3323,7 +3376,7 @@ typedef struct lore_revision_commit_stats_event_data_t {
 // Emitted once, when the push finishes, at statistics level one and above. A
 // push that failed reports what it had done by then. The counts are cumulative
 // across every revision, link and layer the push registers, where
-// [`LoreBranchPushFragmentProgressEventData`] reports the revision in flight.
+// `lore_branch_push_fragment_progress_event_data_t` reports one revision's share.
 //
 // A push stores no payload of its own: a fragment the peer was asked about is
 // deduplicated, copied or put, unless the push ended before it was reached.
@@ -3425,8 +3478,6 @@ typedef struct lore_repository_instance_delete_begin_event_data_t {
   struct lore_string_t path;
   // Whether this is a SWFS-backed instance
   uint8_t is_swfs;
-  // Whether this is a dry-run (preview only)
-  uint8_t dry_run;
 } lore_repository_instance_delete_begin_event_data_t;
 
 // Event data for progress during an instance delete operation.
@@ -3458,6 +3509,65 @@ typedef struct lore_repository_instance_move_complete_event_data_t {
   // New filesystem path of the instance
   struct lore_string_t target_path;
 } lore_repository_instance_move_complete_event_data_t;
+
+// Event data for the start of an instance clone operation.
+typedef struct lore_repository_instance_clone_begin_event_data_t {
+  // Identifier of the instance being cloned
+  struct lore_instance_id_t instance_id;
+  // Filesystem path of the instance being cloned
+  struct lore_string_t source_path;
+  // Filesystem path the clone is created at
+  struct lore_string_t target_path;
+  // How the clone is made
+  enum lore_repository_instance_clone_method_t method;
+  // Filesystem of the volume the clone is created on; empty for
+  // `LORE_REPOSITORY_INSTANCE_CLONE_METHOD_UNSUPPORTED`
+  struct lore_string_t filesystem;
+  // Mount point of the volume the clone is created on; empty for
+  // `LORE_REPOSITORY_INSTANCE_CLONE_METHOD_UNSUPPORTED`
+  struct lore_string_t mount_point;
+  // Bytes the copy takes on that volume, for `LORE_REPOSITORY_INSTANCE_CLONE_METHOD_COPIES_BYTES`;
+  // zero otherwise
+  uint64_t size;
+  // Number of files the copy writes, for `LORE_REPOSITORY_INSTANCE_CLONE_METHOD_COPIES_BYTES`;
+  // zero otherwise
+  uint64_t file_count;
+  // Bytes free on that volume, for `LORE_REPOSITORY_INSTANCE_CLONE_METHOD_COPIES_BYTES`; zero
+  // otherwise
+  uint64_t available_size;
+  // Why the clone copies or cannot be made; empty for
+  // `LORE_REPOSITORY_INSTANCE_CLONE_METHOD_SHARES_BLOCKS`
+  struct lore_string_t reason;
+} lore_repository_instance_clone_begin_event_data_t;
+
+// Event data for progress during an instance clone operation.
+typedef struct lore_repository_instance_clone_progress_event_data_t {
+  // Current phase of the clone operation
+  enum lore_repository_instance_clone_phase_t phase;
+  // The directory the phase removes, for `LORE_REPOSITORY_INSTANCE_CLONE_PHASE_REMOVING_LEFTOVER`;
+  // empty otherwise
+  struct lore_string_t path;
+  // Directories cloned as a whole so far, each with everything in it
+  uint64_t cloned_directory_count;
+  // Files and symbolic links cloned one by one so far
+  uint64_t cloned_entry_count;
+  // Files copied so far
+  uint64_t copied_file_count;
+} lore_repository_instance_clone_progress_event_data_t;
+
+// Event data for the completion of an instance clone operation.
+typedef struct lore_repository_instance_clone_complete_event_data_t {
+  // Identifier of the new instance, zero in a dry run
+  struct lore_instance_id_t instance_id;
+  // Filesystem path of the new instance
+  struct lore_string_t target_path;
+  // Directories cloned as a whole, each with everything in it
+  uint64_t cloned_directory_count;
+  // Files and symbolic links cloned one by one
+  uint64_t cloned_entry_count;
+  // Files whose data was copied
+  uint64_t copied_file_count;
+} lore_repository_instance_clone_complete_event_data_t;
 
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
@@ -3950,6 +4060,12 @@ enum lore_event_id_t {
   LORE_EVENT_REPOSITORY_INSTANCE_MOVE_BEGIN,
   // The completion of an instance move operation.
   LORE_EVENT_REPOSITORY_INSTANCE_MOVE_COMPLETE,
+  // The start of an instance clone operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_CLONE_BEGIN,
+  // Progress during an instance clone operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_CLONE_PROGRESS,
+  // The completion of an instance clone operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_CLONE_COMPLETE,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -4199,6 +4315,9 @@ typedef struct lore_event_t {
     struct lore_repository_instance_delete_complete_event_data_t repository_instance_delete_complete;
     struct lore_repository_instance_move_begin_event_data_t repository_instance_move_begin;
     struct lore_repository_instance_move_complete_event_data_t repository_instance_move_complete;
+    struct lore_repository_instance_clone_begin_event_data_t repository_instance_clone_begin;
+    struct lore_repository_instance_clone_progress_event_data_t repository_instance_clone_progress;
+    struct lore_repository_instance_clone_complete_event_data_t repository_instance_clone_complete;
   };
 } lore_event_t;
 
@@ -4261,9 +4380,9 @@ typedef struct lore_global_args_t {
   uint64_t store_keep_alive_seconds;
   // Force sync data to storage media during store flush
   uint8_t sync_data;
-  // Cache fragment payloads fetched from remote in the local store. Without
-  // this only state fragments and fragments flagged for local cache priority
-  // are retained
+  // Cache fragment payloads fetched from remote, and those written, in the local store, as
+  // a repository's `[store] cache_payloads` does for every command. Without either only state
+  // fragments and fragments flagged for local cache priority are retained
   uint8_t cache;
   // Authentication token to use instead of the one held in the secure token
   // store. Authorization tokens are exchanged from it as they are needed.
@@ -4302,6 +4421,13 @@ typedef struct lore_global_args_t {
   // takes it from the globals it is opened with. Any non-zero value trusts
   // the remote, so a caller zeroes the whole struct, padding included
   uint8_t trust_remote;
+  // Have the call's flushes write the local stores' index in place, rather than replacing each
+  // of its files through a temporary file, which is faster where creating files is slow. If the
+  // process stops or a write fails while a file is being written, the store drops every entry
+  // that file held, including those of revisions and branches not yet pushed. Eviction and
+  // compaction replace the files they write whatever it says, and it is independent of
+  // `sync_data`, which syncs what is written either way. Any non-zero value writes in place
+  uint8_t fast_flush;
 } lore_global_args_t;
 
 // Arguments for resolving user IDs to display names via the remote user service.
@@ -4762,7 +4888,8 @@ typedef struct lore_file_stage_args_t {
   struct lore_string_array_t paths;
   // Case change handling, 0 = error, 1 = update filesystem (keep), 2 = update repository (rename)
   uint32_t case_change;
-  // Force a recursive filesystem scan of directory paths (no effect on file paths)
+  // Walk directory paths recursively on the filesystem, as the global `force` argument also
+  // does (no effect on file paths)
   uint8_t scan;
 } lore_file_stage_args_t;
 
@@ -4900,11 +5027,12 @@ typedef struct lore_lock_file_status_args_t {
 
 // Arguments for querying file locks on a branch, optionally filtered by owner and path.
 typedef struct lore_lock_file_query_args_t {
-  // Branch to query locks on
+  // Branch to query locks on; empty queries every branch, or the current branch where `path`
+  // is given
   struct lore_string_t branch;
-  // Owner filter; empty matches any owner
+  // Owner filter; empty matches any owner. Can't be combined with `path`
   struct lore_string_t owner;
-  // Path filter; empty matches any path
+  // Path filter; empty matches any path. Can't be combined with `owner`
   struct lore_string_t path;
 } lore_lock_file_query_args_t;
 
@@ -4982,16 +5110,21 @@ typedef struct lore_repository_clone_args_t {
   struct lore_string_t layer;
   // (Optional) Layer metadata key to link revisions with
   struct lore_string_t layer_metadata;
-  // (Optional) File containing list of files to prefetch
+  // (Optional) Access recording whose paths a virtual clone warms in the background: one
+  // repository-relative path per line, a directory ending with `/`, `/` for the root. A
+  // relative file path resolves against the caller's working directory.
   struct lore_string_t prefetch;
   // Whether to use the shared store instead of a local immutable store. Zero-initialized
-  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting, except where `vfs`
+  // is a virtual one, which always uses a shared store and refuses
+  // `LORE_SHARED_STORE_MODE_DISABLED` with `InvalidArguments`.
   enum lore_shared_store_mode_t use_shared_store;
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;
   // Clone without local repository tracking (memory-only stores)
   uint8_t no_tracking;
-  // Root files for dependency-based selective clone
+  // Root files for dependency-based selective clone. A root file inside a link is skipped, and
+  // error code 9 (not supported) is returned when every root file is.
   struct lore_string_array_t root_files;
   // Tags to filter dependencies by during resolution
   struct lore_string_array_t dependency_tags;
@@ -5030,7 +5163,9 @@ typedef struct lore_repository_create_args_t {
   // Which VFS to use, if any
   enum lore_vfs_type_t vfs;
   // Whether to use the shared store instead of a local immutable store. Zero-initialized
-  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting, except where `vfs`
+  // is a virtual one, which always uses a shared store and refuses
+  // `LORE_SHARED_STORE_MODE_DISABLED` with `InvalidArguments`.
   enum lore_shared_store_mode_t use_shared_store;
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;
@@ -5259,7 +5394,8 @@ typedef struct lore_revision_sync_args_t {
   uint8_t forward_changes;
   // Reset local modified files to match the incoming revision
   uint8_t reset;
-  // Root files for dependency-based selective sync
+  // Root files for dependency-based selective sync. A root file inside a link is skipped, and
+  // error code 9 (not supported) is returned when every root file is.
   struct lore_string_array_t root_files;
   // Tags to filter dependencies by during resolution
   struct lore_string_array_t dependency_tags;
@@ -6120,6 +6256,16 @@ typedef struct lore_repository_instance_move_args_t {
   // Target path for the instance.
   struct lore_string_t target_path;
 } lore_repository_instance_move_args_t;
+
+// Arguments for cloning the current repository instance to a new path.
+typedef struct lore_repository_instance_clone_args_t {
+  // Path the clone is created at, which must not exist; a relative path is resolved against
+  // `globals->working_directory`, or the process's working directory where that is empty
+  struct lore_string_t target_path;
+  // Nonzero to copy the instance's files where the clone cannot share their data blocks;
+  // zero refuses such a clone
+  uint8_t allow_copy;
+} lore_repository_instance_clone_args_t;
 
 // Arguments for updating the recorded path of the current repository instance.
 typedef struct lore_repository_update_path_args_t {
@@ -8995,6 +9141,8 @@ void lore_file_dump_async(const struct lore_global_args_t *globals,
 
 // Adds dependency relationships between files.
 //
+// Fails with error code 9 (not supported) when a path is inside a link, and changes nothing.
+//
 // # Events
 //
 // ## Standard Events
@@ -9043,6 +9191,8 @@ void lore_file_dependency_add_async(const struct lore_global_args_t *globals,
 
 // Removes dependency relationships between files.
 //
+// Fails with error code 9 (not supported) when a path is inside a link, and changes nothing.
+//
 // # Events
 //
 // ## Standard Events
@@ -9090,6 +9240,8 @@ void lore_file_dependency_remove_async(const struct lore_global_args_t *globals,
                                        struct lore_event_callback_config_t callback);
 
 // Queries dependency information for files.
+//
+// Fails with error code 9 (not supported) when a path is inside a link.
 //
 // # Events
 //
@@ -9250,6 +9402,10 @@ void lore_lock_file_status_async(const struct lore_global_args_t *globals,
                                  struct lore_event_callback_config_t callback);
 
 // Query which files are currently locked, optionally filtered by user or path.
+//
+// A `path` without a `branch` in `lore_lock_file_query_args_t` queries the current branch. A
+// query giving both `owner` and `path` fails with `LORE_ERROR_CODE_INVALID_ARGUMENTS` before the
+// remote is asked.
 //
 // # Events
 //
@@ -9680,8 +9836,8 @@ void lore_link_update_async(const struct lore_global_args_t *globals,
 // A clone needs the remote, so the `offline` global argument does not keep it from connecting: it
 // prepares the clone for working offline instead. With `offline` or `cache`, a clone that writes
 // its files caches every file metadata block of the cloned revision, which staging and committing
-// write to, so both work without the remote, and fails if it cannot. A bare clone writes no files
-// and reads them from the remote when a call needs them.
+// write to, so both work without the remote, and fails if it cannot. A bare or virtual clone writes
+// no files and reads them from the remote when a call needs them.
 //
 // # Events
 //
@@ -12047,7 +12203,7 @@ void lore_storage_close_async(const struct lore_global_args_t *globals,
 
 // Flush pending writes through the handle's stores.
 //
-// On disk-backed stores this performs an fsync honoring `globals.sync_data`.
+// On disk-backed stores this writes as `globals.sync_data` and `globals.fast_flush` ask.
 // On in-memory stores the underlying flush is a no-op and the call still
 // completes with `status: 0`.
 int32_t lore_storage_flush(const struct lore_global_args_t *globals,
@@ -12831,6 +12987,61 @@ int32_t lore_repository_instance_move(const struct lore_global_args_t *globals,
 void lore_repository_instance_move_async(const struct lore_global_args_t *globals,
                                          const struct lore_repository_instance_move_args_t *args,
                                          struct lore_event_callback_config_t callback);
+
+// Clone the current repository instance to `args->target_path`, sharing its data blocks where
+// the destination allows it, and register the clone as an instance of its own on the same
+// revision, branch and staged state. The clone holds the instance's and the store's locks while
+// it copies, so other calls on the instance, and calls from other processes on the store, that
+// open the store wait for it. An instance delete waits too, since it opens the store to deregister
+// the instance before it removes any file. An instance move renames the instance before it opens
+// the store, so a move makes the clone fail, or on Windows is refused while the clone lists one of
+// its directories. `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_BEGIN` says how the clone is made, once the
+// instance's store and the destination have passed their checks and before any of the instance
+// is copied; a refusal before that, of the store or the destination, comes only with the
+// completion. Delivers `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_PROGRESS` per phase, and each event
+// interval (`globals->event_interval_ms`) while it copies, and
+// `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_COMPLETE`, which names the new instance.
+//
+// Fails with:
+// - error code 9 (not supported) for a clone that cannot share blocks while `args->allow_copy`
+//   is zero, refused before anything is copied or, for an entry that turns out not to share
+//   blocks, partway through the copy; and for an instance with a local store or a virtual
+//   clone, whatever `args->allow_copy` is;
+// - error code 3 (invalid arguments) for a destination that exists before the clone moves into
+//   place, names no directory, has no parent directory that can be resolved, has a name too
+//   long for the directory the clone writes beside it, is nested in another instance or a
+//   virtual clone's mount, or is where another live instance is registered, and where a path
+//   inside the copy is taken while the clone writes it;
+// - error code 4 (invalid path) where the instance's Lore directory lies outside its tree;
+// - error code 118 (oversized) for a copy the destination has no room for, and where a volume the
+//   clone writes fills while it runs;
+// - error code 82 (file not found) where the instance, or an entry the clone needs, is moved or
+//   removed while it is copied.
+//
+// Failures every repository call can report, such as code 89 (repository not found), are
+// reported as for those calls; any other failure of the clone is internal.
+//
+// A failure while the clone registers itself, after it is at `args->target_path`, leaves the
+// instance there; it registers itself when a write command next opens it. A failure before that
+// leaves nothing at `args->target_path`: the call returns once it has tried to remove what the
+// clone copied, which takes minutes for a large tree; what it cannot remove the next clone to the
+// same destination removes.
+//
+// With `dry_run` set in `globals`, runs the checks that take no lock, sending
+// `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_BEGIN` as the clone does, fails as the clone would where
+// one of those checks refuses it, and otherwise sends a
+// `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_COMPLETE` with a zero instance ID, and writes nothing but
+// the probe files it removes again. The checks for
+// another live instance registered at the destination and for a branch to clone need the store,
+// so only the clone itself makes them.
+int32_t lore_repository_instance_clone(const struct lore_global_args_t *globals,
+                                       const struct lore_repository_instance_clone_args_t *args,
+                                       struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_repository_instance_clone`.
+void lore_repository_instance_clone_async(const struct lore_global_args_t *globals,
+                                          const struct lore_repository_instance_clone_args_t *args,
+                                          struct lore_event_callback_config_t callback);
 
 // Update the recorded path of the current repository instance to its present
 // location.

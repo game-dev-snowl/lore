@@ -14,6 +14,10 @@ from link_helpers import (
 )
 from test_utils import status_by_path
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 @pytest.mark.smoke
 def test_link_dirty_inside_a_link_mounted_from_a_subfolder(new_lore_repo):
@@ -41,6 +45,8 @@ def test_link_dirty_inside_a_link_mounted_from_a_subfolder(new_lore_repo):
         parent_repo.dirty_move(modified, added)
     with pytest.raises(NotSupportedError):
         parent_repo.dirty_copy(DEFAULT_PARENT_FILE, added)
+    with pytest.raises(NotSupportedError):
+        parent_repo.dirty_copy(DEFAULT_PARENT_FILE, in_new_dir)
 
     parent_repo.write_files(
         {modified: "edited through the mount\n"}

@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 use std::env;
 use std::num::NonZeroU8;
+use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use config::Config;
 use lore_base::runtime::TokioSettings;
@@ -13,6 +16,7 @@ use lore_revision::branch::CachedRevisionItem;
 use lore_revision::branch::CachedRevisionListHeader;
 use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
 use lore_revision::environment::EnvironmentConfig;
+use lore_revision::store::composite::ReadReplicaSelection;
 use lore_revision::util::time::RetrySettings;
 use lore_storage::hash;
 use lore_storage::hash::StringHash;
@@ -702,6 +706,12 @@ pub struct ServerSettings {
     // the internal-only QUIC server settings
     #[serde(default, deserialize_with = "deserialize_quic_internal")]
     pub quic_internal: Option<QuicSettings>,
+    /// Unix sockets for containers on this machine.
+    pub uds: Option<UdsSettings>,
+    /// Storage connections a `remote` store opens to its upstream, shared by every repository the
+    /// store reaches there.
+    #[serde(default = "default_upstream_connections")]
+    pub upstream_connections: u32,
     /// Seconds to wait for existing connections to close gracefully after shutdown signal.
     #[serde(default = "default_connection_close_timeout")]
     pub connection_close_timeout_seconds: u16,
@@ -716,6 +726,104 @@ pub struct ServerSettings {
     /// Disk space monitoring for the local store paths.
     #[serde(default)]
     pub local_store_monitor: LocalStoreMonitorSettings,
+}
+
+/// The machine server's Unix sockets, one per container, each carrying the storage protocol and
+/// forwarded gRPC.
+#[derive(Clone, Debug, Deserialize)]
+pub struct UdsSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Socket paths, one per container, each in a directory bind mounted into its container: the
+    /// server binds a new socket file at each start. Each is claimed with a lock file beside it,
+    /// `<socket>.lock`. On Windows the server refuses a socket directory another account could
+    /// change, and creates a missing one that only the system, the administrators and its owner
+    /// may change.
+    #[serde(default)]
+    pub sockets: Vec<PathBuf>,
+    /// Permission bits of each socket file on Unix. On Windows a mode that lets others write a
+    /// socket lets the machine's users connect to it, and the socket otherwise keeps what its
+    /// directory grants.
+    #[serde(default = "UdsSettings::default_socket_mode")]
+    pub socket_mode: u32,
+    /// Requests a storage connection may have in handling.
+    #[serde(default = "UdsSettings::default_credits")]
+    pub credits: u32,
+    /// Request bodies in handling and unwritten responses a storage connection may hold. A read in
+    /// handling holds the largest response.
+    #[serde(default = "UdsSettings::default_credit_bytes")]
+    pub credit_bytes: u32,
+    /// Connections a socket holds at once, storage and forwarded gRPC connections alike; one
+    /// container's processes share them. A closed connection counts until its requests in
+    /// handling finish.
+    #[serde(default = "UdsSettings::default_max_connections_per_socket")]
+    pub max_connections_per_socket: usize,
+    /// Request bodies of 4096 bytes or more in handling and unwritten responses all of a socket's
+    /// storage connections may hold together. A read in handling holds the largest response.
+    /// Smaller bodies count against their connection's limits only. The buffers of forwarded gRPC
+    /// connections are not counted.
+    #[serde(default = "UdsSettings::default_socket_bytes")]
+    pub socket_bytes: usize,
+    /// Ceiling on handling one request, as on QUIC: 1 to 65535. A request without one could hold
+    /// its connection, and the reader waiting for its credit, for good. Clients learn it, so their
+    /// deadline for a lost response stays past it.
+    #[serde(default = "UdsSettings::default_handler_timeout_seconds")]
+    pub handler_timeout_seconds: u64,
+    /// Hosts gRPC is forwarded to, keyed by the host a client names, valued by the URL reached.
+    #[serde(default)]
+    pub forward: HashMap<String, String>,
+    /// Bounds the storage hello and the HTTP/2 client preface, so a connection that stops partway
+    /// through either does not hold its place. Not configurable.
+    #[serde(skip, default = "UdsSettings::default_handshake_timeout")]
+    pub(crate) handshake_timeout: Duration,
+    /// How long a connection's peer may take none of its responses before it is dropped: QUIC's
+    /// default idle timeout. A client reads whatever arrives, so only one that stopped running
+    /// stalls this long. Not configurable.
+    #[serde(skip, default = "UdsSettings::default_stall_timeout")]
+    pub(crate) stall_timeout: Duration,
+}
+
+impl UdsSettings {
+    /// These settings with a connection's handshake bounded by `handshake` and a peer that takes
+    /// no responses dropped after `stall`.
+    #[cfg(feature = "test-util")]
+    pub fn timing_out(mut self, handshake: Duration, stall: Duration) -> Self {
+        self.handshake_timeout = handshake;
+        self.stall_timeout = stall;
+        self
+    }
+
+    fn default_handshake_timeout() -> Duration {
+        Duration::from_secs(5)
+    }
+
+    fn default_stall_timeout() -> Duration {
+        Duration::from_millis(crate::quic::quinn::DEFAULT_IDLE_TIMEOUT_MILLIS)
+    }
+
+    fn default_socket_mode() -> u32 {
+        0o666
+    }
+
+    fn default_credits() -> u32 {
+        4000
+    }
+
+    fn default_credit_bytes() -> u32 {
+        256 * 1024 * 1024
+    }
+
+    fn default_max_connections_per_socket() -> usize {
+        64
+    }
+
+    fn default_socket_bytes() -> usize {
+        1024 * 1024 * 1024
+    }
+
+    fn default_handler_timeout_seconds() -> u64 {
+        50
+    }
 }
 
 /// Periodic monitoring of the disk space available to the local store.
@@ -795,6 +903,10 @@ fn default_connection_close_timeout() -> u16 {
     5
 }
 
+fn default_upstream_connections() -> u32 {
+    4
+}
+
 fn default_runtime_shutdown_timeout() -> u16 {
     25
 }
@@ -817,6 +929,15 @@ pub struct CompositeStoreSettings {
     /// durable store. Absent enables it.
     pub record_copy_out_of_band: Option<bool>,
     pub durable_store_delay_ms: Option<u64>,
+    /// Which read replicas a read that misses locally is sent to. Absent fans out to every one.
+    pub read_replica_selection: Option<ReadReplicaSelection>,
+    /// How many read replicas a round robin read tries, capped at the number of read replicas.
+    /// Absent uses [`DEFAULT_ROUND_ROBIN_MAX_TRIES`](lore_revision::store::composite::DEFAULT_ROUND_ROBIN_MAX_TRIES).
+    pub round_robin_max_tries: Option<NonZeroUsize>,
+    /// How long a round robin read waits on one read replica before trying the next, in
+    /// milliseconds, at least 1. Absent uses
+    /// [`DEFAULT_ROUND_ROBIN_TRY_LIMIT`](lore_revision::store::composite::DEFAULT_ROUND_ROBIN_TRY_LIMIT).
+    pub round_robin_try_limit_ms: Option<NonZeroU64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -884,6 +1005,11 @@ pub struct MutableStoreSettings {
 pub struct RemoteStoreSettings {
     pub auth_url: Option<String>,
     pub remote_url: String,
+    /// Whether the immutable store checks each payload the upstream serves against its address.
+    /// Off, it trusts the upstream and checks only a payload's sizes: clients check what they
+    /// read, and a heal they ask for reaches the upstream.
+    #[serde(default)]
+    pub verify: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -891,7 +1017,11 @@ pub struct ReplicatedStoreSettings {
     pub remote_url: String,
     pub certs: Option<CertificateSettings>,
     pub regenerate_retry: RetrySettings,
-    pub periodic_client_refresh_secs: u64,
+    /// The number of clients, each with its own connection to the remote. Every limit and
+    /// transport setting below applies to each client separately.
+    #[serde(default = "default_replicated_store_num_clients")]
+    pub num_clients: NonZeroUsize,
+    pub periodic_client_refresh_secs: NonZeroU64,
     #[serde(default = "default_quic_client_monitor_interval_secs")]
     pub client_metrics_interval_seconds: u64,
     /// how many inflight messages are allowed before we self-throttle
@@ -904,6 +1034,10 @@ pub struct ReplicatedStoreSettings {
     /// refreshed.
     #[serde(default = "default_peer_initial_cwnd_bytes")]
     pub initial_cwnd_bytes: InitialCwndBytes,
+}
+
+fn default_replicated_store_num_clients() -> NonZeroUsize {
+    NonZeroUsize::new(2).expect("2 is not zero")
 }
 
 #[derive(Copy, Clone, Default, Debug, Deserialize, PartialEq)]

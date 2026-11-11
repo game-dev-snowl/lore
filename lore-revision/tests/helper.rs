@@ -144,6 +144,25 @@ pub async fn test_repository_create(
     mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
     repository_id: lore_revision::lore::RepositoryId,
 ) -> TestRepository {
+    test_repository_create_with_remote(
+        immutable_store,
+        mutable_store,
+        repository_id,
+        Err(lore_transport::ProtocolError::from(
+            lore_base::error::NoRemote,
+        )),
+    )
+    .await
+}
+
+/// [`test_repository_create`] whose context answers `remote` as its remote connection.
+#[allow(dead_code)]
+pub async fn test_repository_create_with_remote(
+    immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+    repository_id: lore_revision::lore::RepositoryId,
+    remote: Result<std::sync::Arc<lore_transport::Connection>, lore_transport::ProtocolError>,
+) -> TestRepository {
     let tempdir = generate_tempdir();
     let path = tempdir.to_path_buf();
     let default_branch_id = lore_base::types::Context::from(uuid::Uuid::now_v7());
@@ -166,7 +185,8 @@ pub async fn test_repository_create(
             default_repository_creation_args(immutable_store, mutable_store)
                 .with_path(&path)
                 .with_id(repository_id)
-                .with_instance_id(created.instance_id),
+                .with_instance_id(created.instance_id)
+                .with_remote(remote),
         )
         .with_write_token(write_token.share()),
     );
@@ -369,6 +389,21 @@ pub fn test_file_write(path: &std::path::Path, contents: &[u8]) {
         .unwrap_or_else(|_| panic!("Failed to write test file at {}", path.display()));
 }
 
+/// Whether the file system holding `dir` holds one spelling of a name and answers lookups in any
+/// other. Windows and macOS do by default and Linux does not, but a mount can be either on any of
+/// them, so a test asks rather than assumes.
+#[allow(dead_code)]
+pub fn case_insensitive(dir: &std::path::Path) -> bool {
+    #[allow(clippy::disallowed_methods)]
+    {
+        let probe = dir.join("CaseProbe");
+        std::fs::write(&probe, b"").expect("write probe");
+        let insensitive = std::fs::metadata(dir.join("caseprobe")).is_ok();
+        std::fs::remove_file(&probe).expect("remove probe");
+        insensitive
+    }
+}
+
 /// Reconciles the working tree against `state_staged`, mutating it in place as
 /// `lore status --scan` does, and returns the changes detected.
 #[allow(dead_code)]
@@ -407,12 +442,26 @@ pub async fn test_scan_path_with_intent(
     path: Option<lore_revision::util::path::RelativePath>,
     intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
 ) -> Vec<lore_revision::change::NodeChange> {
+    test_scan_path_result(repository, state_staged, state_current, path, intent)
+        .await
+        .expect("Failed to diff filesystem")
+}
+
+/// [`test_scan_path_with_intent`], answering the diff's failure rather than panicking on it.
+#[allow(dead_code)]
+pub async fn test_scan_path_result(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+    path: Option<lore_revision::util::path::RelativePath>,
+    intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
+) -> Result<Vec<lore_revision::change::NodeChange>, lore_revision::state::StateError> {
     let operation = lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
         repository.file_system().as_ref(),
     )
     .await
     .expect("Failed to start filesystem operation");
-    let changes = lore_revision::state::diff_filesystem(
+    let changes = match lore_revision::state::diff_filesystem(
         &operation,
         lore_revision::fs::filesystem_provider::FilesystemDiffTree {
             repository: repository.clone(),
@@ -428,15 +477,74 @@ pub async fn test_scan_path_with_intent(
         std::sync::Arc::new(Vec::new()),
     )
     .await
-    .expect("Failed to diff filesystem")
-    .collect()
-    .await
-    .expect("Failed to diff filesystem");
+    {
+        Ok(changes) => changes.collect().await,
+        Err(err) => Err(err),
+    };
     operation
         .finalize()
         .await
         .expect("Failed to finish filesystem operation");
     changes
+}
+
+/// What `status` reports of `paths`, or of the whole repository for `None`, by path: the action
+/// and whether the change is dirty. `scan` asks for `--scan`.
+#[allow(dead_code)]
+pub async fn test_status_files_at(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    paths: Option<Vec<lore_revision::util::path::RelativePath>>,
+    scan: bool,
+) -> std::collections::BTreeMap<String, (lore_revision::interface::LoreFileAction, bool)> {
+    let files = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let captured = files.clone();
+    let callback: lore_revision::interface::LoreEventCallback = Some(Box::new(move |event| {
+        if let lore_revision::event::LoreEvent::RepositoryStatusFile(data) = event {
+            captured.lock().expect("status files").insert(
+                data.path.as_str().to_string(),
+                (data.action, data.flag_dirty != 0),
+            );
+        }
+    }));
+    let execution = std::sync::Arc::new(
+        lore_revision::interface::ExecutionContext::new_client_with_user_id(
+            lore_revision::interface::LoreGlobalArgs::default(),
+            lore_revision::relay::EventDispatcher::new(callback),
+            "test-user".to_string(),
+        ),
+    );
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            execution.clone(),
+            lore_revision::repository::status::status_boxed(
+                repository,
+                paths,
+                lore_revision::repository::status::StatusOptions {
+                    staged: true,
+                    scan,
+                    check_dirty: false,
+                    reset: false,
+                    sync_point: false,
+                    revision_only: false,
+                    count: false,
+                },
+            ),
+        )
+        .await
+        .expect("status");
+    execution.dispatcher.drain().await;
+    files.lock().expect("status files").clone()
+}
+
+/// Each path's action in `reported`, as status lists it.
+#[allow(dead_code)]
+pub fn test_status_actions(
+    reported: std::collections::BTreeMap<String, (lore_revision::interface::LoreFileAction, bool)>,
+) -> Vec<(String, lore_revision::interface::LoreFileAction)> {
+    reported
+        .into_iter()
+        .map(|(path, (action, _))| (path, action))
+        .collect()
 }
 
 /// [`test_scan`] read one change at a time, for the walk's other consumption path.
@@ -660,6 +768,30 @@ pub async fn committed_repository(
     (repository, tempdir)
 }
 
+/// Creates the branch `name` in `category` off the current branch of `repository`'s instance, as
+/// `lore_branch_create` does: under `id` where one is given, and forced where `force` is set.
+#[allow(dead_code)]
+pub async fn create_branch_on_instance(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    name: &str,
+    id: Option<lore_revision::lore::BranchId>,
+    category: &str,
+    force: bool,
+) -> Result<(), lore_revision::branch::create::CreateError> {
+    let token = repository
+        .try_write_token()
+        .expect("The repository was opened for writing");
+    lore_revision::branch::create::create(
+        repository.clone(),
+        token,
+        name.to_string(),
+        id,
+        category.to_string(),
+        force,
+    )
+    .await
+}
+
 /// `names`, relative to `root`, as the paths a command is given.
 #[allow(dead_code)]
 pub fn path_arguments(
@@ -779,6 +911,89 @@ pub async fn replaced_intermediate_repository(
     std::fs::create_dir_all(root.join("src/Intermediate")).expect("Create directory failed");
     test_file_write(root.join("src/Intermediate/a.txt").as_path(), b"directory");
     (ruled, tempdir)
+}
+
+/// Mounts at `mount` in `repository`'s staged tree a link to the repository `linked_id`, at a
+/// revision whose tree holds the file `src/Intermediate`, the link added there and not committed.
+#[allow(dead_code)]
+pub async fn mount_intermediate(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    mount: &str,
+    linked_id: lore_revision::lore::RepositoryId,
+) {
+    let linked = repository.to_link_context(linked_id).await;
+    let token = repository
+        .try_write_token()
+        .expect("The repository was opened for writing");
+    let linked_tree = lore_revision::state::State::new();
+    let src = linked_tree
+        .node_add(
+            linked.clone(),
+            lore_revision::node::ROOT_NODE,
+            lore_revision::node::Node {
+                name_hash: lore_storage::hash::hash_string("src"),
+                ..Default::default()
+            },
+            "src",
+        )
+        .await
+        .expect("Adding src failed");
+    linked_tree
+        .node_add(
+            linked.clone(),
+            src,
+            lore_revision::node::Node {
+                flags: lore_revision::node::NodeFlags::File.bits(),
+                name_hash: lore_storage::hash::hash_string("Intermediate"),
+                ..Default::default()
+            },
+            "Intermediate",
+        )
+        .await
+        .expect("Adding src/Intermediate failed");
+    linked_tree.set_revision_number(1);
+    let revision = linked_tree
+        .serialize(linked, token)
+        .await
+        .expect("Serializing the linked tree failed");
+
+    let staged = next_tree(repository).await;
+    let link = staged
+        .node_add(
+            repository.clone(),
+            lore_revision::node::ROOT_NODE,
+            lore_revision::node::Node {
+                flags: lore_revision::node::NodeFlags::Link.bits(),
+                name_hash: lore_storage::hash::hash_string(mount),
+                child: lore_revision::node::ROOT_NODE,
+                address: lore_base::types::Address {
+                    hash: revision,
+                    context: linked_id.into(),
+                },
+                ..Default::default()
+            },
+            mount,
+        )
+        .await
+        .expect("Adding the link failed");
+    staged
+        .link_add(
+            repository.clone(),
+            linked_id,
+            lore_revision::lore::BranchId::default(),
+            revision,
+            link,
+            lore_revision::link::LinkFlags::NoFlags,
+        )
+        .await
+        .expect("Registering the link failed");
+    let signature = staged
+        .serialize(repository.clone(), token)
+        .await
+        .expect("Serializing the staged tree failed");
+    lore_revision::instance::store_staged_anchor(repository, signature)
+        .await
+        .expect("Storing the staged anchor failed");
 }
 
 /// The tree the next commit takes: the staged one, or the current one where nothing is staged.
@@ -907,17 +1122,25 @@ pub mod in_memory {
     use lore_base::types::BranchId;
     use lore_base::types::Context;
     use lore_base::types::Hash;
+    use lore_revision::commit::BasedOn;
     use lore_revision::commit::commit_in_memory_revision;
+    use lore_revision::commit::weave_history;
+    use lore_revision::lore::RepositoryId;
     use lore_revision::metadata::Metadata;
     use lore_revision::node::Node;
     use lore_revision::node::NodeFlags;
     use lore_revision::node::NodeID;
+    use lore_revision::node::ROOT_NODE;
     use lore_revision::repository::InMemoryContext;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::state::Content;
     use lore_revision::state::Mark;
+    use lore_revision::state::Rewrite;
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
+
+    use super::RepositoryContextCreationArgsExt;
 
     struct Marker;
     impl InMemoryContext for Marker {}
@@ -932,9 +1155,20 @@ pub mod in_memory {
         immutable: Arc<dyn lore_storage::ImmutableStore>,
         mutable: Arc<dyn lore_storage::MutableStore>,
     ) -> Arc<RepositoryContext> {
+        repository_in(immutable, mutable, RepositoryId::from(uuid::Uuid::now_v7()))
+    }
+
+    /// [`repository`] as a new instance of the repository `id`.
+    pub fn repository_in(
+        immutable: Arc<dyn lore_storage::ImmutableStore>,
+        mutable: Arc<dyn lore_storage::MutableStore>,
+        id: RepositoryId,
+    ) -> Arc<RepositoryContext> {
         Arc::new(
-            RepositoryContext::new(super::default_repository_creation_args(immutable, mutable))
-                .with_write_token(token()),
+            RepositoryContext::new(
+                super::default_repository_creation_args(immutable, mutable).with_id(id),
+            )
+            .with_write_token(token()),
         )
     }
 
@@ -963,6 +1197,32 @@ pub mod in_memory {
 
     pub fn branch_id() -> BranchId {
         Context::from(uuid::Uuid::now_v7())
+    }
+
+    /// A link named `name` to the root of the revision `pin` of `link_repository`.
+    pub fn link_node(name: &str, link_repository: RepositoryId, pin: Hash) -> Node {
+        Node {
+            flags: NodeFlags::Link.bits(),
+            mode: 0o755,
+            name_hash: hash_string(name),
+            child: ROOT_NODE,
+            address: Address {
+                hash: pin,
+                context: Context::from(link_repository),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A revision of the repository `link_repository` holding `l.txt`.
+    pub async fn linked_revision(
+        repository: &Arc<RepositoryContext>,
+        link_repository: RepositoryId,
+    ) -> Hash {
+        let linked = repository.to_link_context(link_repository).await;
+        let state = State::new();
+        add(&state, linked.clone(), ROOT_NODE, file("l.txt"), "l.txt").await;
+        commit(&linked, &state, Hash::default(), branch_id()).await
     }
 
     /// Adds `node` as `name` under `parent`, staged as an add. Every write verb marks its staged
@@ -1034,6 +1294,54 @@ pub mod in_memory {
         State::deserialize(repository.clone(), revision)
             .await
             .expect("deserializing the revision must succeed")
+    }
+
+    /// Sets the content of file `node_id` of `state` to `address`, staged with `staged`.
+    pub async fn modify(
+        state: &State,
+        repository: &Arc<RepositoryContext>,
+        node_id: NodeID,
+        address: Address,
+        staged: NodeFlags,
+    ) {
+        state
+            .node_rewrite(
+                repository,
+                node_id,
+                &Content {
+                    mode: 0o644,
+                    size: 11,
+                    address,
+                },
+                Rewrite::Plain,
+            )
+            .await
+            .expect("modifying the file");
+        state
+            .node_mark(
+                repository,
+                node_id,
+                Mark::staged_and_dirty(staged, NodeFlags::DirtyModify),
+            )
+            .await
+            .expect("staging the modification");
+    }
+
+    /// `merged`, woven again as the merge a sync stages for divergent history: the remote latest
+    /// first, and the local latest, which the tree of `merged` was built from, second.
+    pub async fn weave_as_divergent_merge(
+        repository: &Arc<RepositoryContext>,
+        merged: Hash,
+        remote_latest: Hash,
+        local_latest: Hash,
+    ) -> Arc<State> {
+        let state = revision_state(repository, merged).await;
+        state.set_parent_self(remote_latest);
+        state.set_parent_other(local_latest);
+        weave_history(repository.clone(), state.clone(), BasedOn::Other)
+            .await
+            .expect("weaving the merge history");
+        state
     }
 }
 

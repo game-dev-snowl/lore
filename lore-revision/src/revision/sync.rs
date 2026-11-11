@@ -901,27 +901,24 @@ pub(crate) async fn sync(
 
     let cache_repository = repository.clone();
     let cache_state = state_target.clone();
-    let cache_task = Some(lore_spawn!(async move {
-        // Ignore errors during caching
-        let _ = cache_state.cache_fragments(cache_repository, false).await;
-    }));
-
     let state_synced = state_target.clone();
     with_operation::<_, SyncError, _>(repository_current.file_system(), async |operation| {
-        Box::pin(realize_state(
-            repository_current.clone(),
-            repository.clone(),
-            operation.clone(),
-            state_current,
-            state_target,
-            options.clone(),
-        ))
+        let cache_task = lore_spawn!(async move {
+            // Ignore errors during caching
+            let _ = cache_state.cache_fragments(cache_repository, false).await;
+        });
+        realize_joining(
+            cache_task,
+            Box::pin(realize_state(
+                repository_current.clone(),
+                repository.clone(),
+                operation.clone(),
+                state_current,
+                state_target,
+                options.clone(),
+            )),
+        )
         .await?;
-
-        // Make sure caching has finished
-        if let Some(task) = cache_task {
-            let _ = task.await;
-        }
 
         // Safe to handle error when cache task has finished
         let modified_times = operation.take_modified_times();
@@ -1304,6 +1301,22 @@ async fn sync_layers(
     Ok(())
 }
 
+/// Awaits `realize`, then `beside`, a task run alongside it, and answers what `realize` did.
+///
+/// The task is joined whether or not realizing fails. It holds the repository, and a sync that
+/// answered before it ended would leave the repository held once the command completes. It is
+/// joined rather than aborted: aborting would end the task but not the fetches it starts, which a
+/// dropped join set aborts without waiting for.
+#[lore_macro::test_pub]
+pub(crate) async fn realize_joining(
+    beside: tokio::task::JoinHandle<()>,
+    realize: impl Future<Output = Result<(), SyncError>>,
+) -> Result<(), SyncError> {
+    let realized = realize.await;
+    let _ = beside.await;
+    realized
+}
+
 /// Drops the times an operation collected, for a caller that does not know which revision
 /// the operation leaves current.
 fn discard_modified_times<T>((result, modified_times): (T, RecordedModifiedTimes)) -> T {
@@ -1335,6 +1348,10 @@ pub struct SyncVerifyArgs {
     pub operation: Arc<InstanceOperationImpl>,
     pub current: crate::state::NodeMapping,
     pub options: Arc<SyncOptions>,
+    /// Whether the verify gives the files it finds holding the incoming content the changes' own
+    /// executable bits, once every change has passed. False where a realize that verifies again
+    /// follows.
+    pub carries_modes: bool,
 }
 
 pub async fn sync_verify_filesystem(
@@ -1365,6 +1382,23 @@ pub struct SyncCompleteStats {
 pub struct SyncRealizeStats {
     pub discovery: DiscoveryStats,
     pub complete: SyncCompleteStats,
+    pub kept_moves: KeptMoves,
+}
+
+/// The moves a realize carries out without their rename, leaving the source where it stands: the
+/// rename was refused, and the destination names the source's own entry or cannot be told apart
+/// from it. Counted, with the first, for the one warning the realize ends with.
+#[derive(Default)]
+pub struct KeptMoves {
+    pub count: AtomicUsize,
+    pub first: std::sync::OnceLock<KeptMove>,
+}
+
+/// A move [`KeptMoves`] counts: where it is from and to, and why it was kept.
+pub struct KeptMove {
+    pub from: RelativePath,
+    pub to: RelativePath,
+    pub reason: String,
 }
 
 impl LoreRevisionSyncProgressEventData {

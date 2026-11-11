@@ -34,6 +34,7 @@ mod pending;
 mod relocate;
 mod reparent;
 mod save;
+mod scoped_diff;
 mod served;
 mod stream;
 mod sweep;
@@ -74,8 +75,9 @@ fn an_action_records_matching_dirty_and_staged_flags() {
 }
 
 use lore_base::runtime::LORE_CONTEXT;
-use lore_revision::state::test_util::push_distinct;
+use lore_revision::state::push_distinct;
 use lore_revision::state::*;
+use lore_storage::FlushOptions;
 
 use crate::fs::filesystem_provider::setup_test_execution;
 
@@ -440,11 +442,12 @@ async fn a_block_added_after_a_serialize_reads_the_serialized_file_metadata_list
     );
 }
 
-/// A store that holds every get of the hashes it is told to hold until released, and counts
-/// every get.
-struct HoldingStore {
+/// A store that holds every get of the hashes it is told to hold until released, answers every get
+/// of the hashes it is told to refuse as missing, and counts every get.
+pub(crate) struct HoldingStore {
     inner: Arc<dyn lore_storage::ImmutableStore>,
     held: std::sync::Mutex<Vec<Hash>>,
+    refused: std::sync::Mutex<Vec<Hash>>,
     released: tokio::sync::Notify,
     gets: std::sync::atomic::AtomicUsize,
 }
@@ -453,12 +456,7 @@ struct HoldingStore {
 async fn holding_repository(
     backing: &Arc<RepositoryContext>,
 ) -> (Arc<HoldingStore>, Arc<RepositoryContext>) {
-    let store = Arc::new(HoldingStore {
-        inner: backing.immutable_store(),
-        held: std::sync::Mutex::new(Vec::new()),
-        released: tokio::sync::Notify::new(),
-        gets: std::sync::atomic::AtomicUsize::new(0),
-    });
+    let store = HoldingStore::over(backing.immutable_store());
     let mutable = lore_storage::local::mutable_store::create(
         None::<&str>,
         lore_storage::MutableStoreSettings::default(),
@@ -471,6 +469,22 @@ async fn holding_repository(
 }
 
 impl HoldingStore {
+    /// A store over `inner`, holding and refusing nothing yet.
+    pub(crate) fn over(inner: Arc<dyn lore_storage::ImmutableStore>) -> Arc<Self> {
+        Arc::new(HoldingStore {
+            inner,
+            held: std::sync::Mutex::new(Vec::new()),
+            refused: std::sync::Mutex::new(Vec::new()),
+            released: tokio::sync::Notify::new(),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Answers every later get of `hash` as missing.
+    pub(crate) fn refuse(&self, hash: Hash) {
+        self.refused.lock().expect("refused hashes").push(hash);
+    }
+
     fn gets(&self) -> usize {
         self.gets.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -510,6 +524,14 @@ impl lore_storage::ImmutableStore for HoldingStore {
         address: Address,
     ) -> Result<lore_storage::StoreGetData, lore_storage::StoreError> {
         self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .refused
+            .lock()
+            .expect("refused hashes")
+            .contains(&address.hash)
+        {
+            return Err(lore_storage::StoreError::from(lore_base::error::NotFound));
+        }
         self.wait_while_held(&address.hash).await;
         self.inner.clone().get(partition, address).await
     }
@@ -593,8 +615,8 @@ impl lore_storage::ImmutableStore for HoldingStore {
         self.inner.max_query_batch()
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), lore_storage::StoreError> {
+        self.inner.clone().flush(options).await
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
@@ -1199,6 +1221,59 @@ async fn what_one_comparison_established_answers_the_next() {
         .expect("an established comparison reads nothing"),
         NodeComparison::Differs
     ));
+}
+
+/// A file written right after [`time_before_next_write`] carries a later time, so a time recorded
+/// for content served from elsewhere never matches the file a later write puts at the path.
+/// Each round can write within the millisecond the time was taken in. The probe directory is
+/// in no working tree and holds nothing afterward.
+#[tokio::test]
+async fn a_file_written_after_the_time_before_the_next_write_carries_a_later_time() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let probe = dir.child("probe");
+    let driver = lore_io::IoDriver::global();
+    driver
+        .create_dir_all(&probe)
+        .await
+        .expect("create the probe directory");
+    let file = dir.path().join("written.bin");
+    for round in 0..64u8 {
+        let before = time_before_next_write(Some(&probe)).await;
+        driver
+            .write_file_bytes(&file, Bytes::copy_from_slice(&[round]), false)
+            .await
+            .expect("write the file");
+        let written = lore_revision::util::fs::modified_millis(
+            driver.stat(&file).await.expect("stat the file").modified,
+        );
+        assert!(
+            written > before,
+            "round {round}: written at {written}, recorded {before}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(&probe)
+            .expect("list the probe directory")
+            .count(),
+        0,
+        "the probe is removed"
+    );
+}
+
+/// A directory that cannot be stamped, or none, gives the process clock.
+#[tokio::test]
+async fn the_time_before_the_next_write_is_the_process_clock_without_a_probe() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let missing = dir.child("missing");
+    for probe in [None, Some(missing.as_path())] {
+        let before = lore_revision::util::fs::modified_millis(None);
+        let time = time_before_next_write(probe).await;
+        let after = lore_revision::util::fs::modified_millis(None);
+        assert!(
+            (before..=after).contains(&time),
+            "{probe:?}: {time} not in {before}..={after}"
+        );
+    }
 }
 
 /// A file removed under a run of comparisons reads as unreadable, not as differing.
@@ -3535,4 +3610,26 @@ async fn walk_children_restarts_past_a_child_moved_away() {
         .expect("the walk must restart, not fail");
     assert_eq!(visited, vec![a]);
     assert!(walked.may_repeat, "a restarted walk may repeat");
+}
+
+#[tokio::test]
+async fn a_node_link_crosses_a_link_where_its_repository_or_revision_differs() {
+    with_state(|repository, state| async move {
+        state.set_revision(Hash::from([1; 32]));
+        let link = |node, repository, revision: u8| NodeLink {
+            node,
+            repository,
+            revision: Hash::from([revision; 32]),
+        };
+        let own = repository.id;
+        let other = RepositoryId::from([9; 16]);
+
+        assert!(!link(1, own, 1).crosses_link(&repository, &state));
+        assert!(!link(ROOT_NODE, own, 1).crosses_link(&repository, &state));
+        assert!(link(1, other, 1).crosses_link(&repository, &state));
+        assert!(link(1, own, 2).crosses_link(&repository, &state));
+        assert!(link(ROOT_NODE, other, 1).crosses_link(&repository, &state));
+        assert!(!NodeLink::invalid().crosses_link(&repository, &state));
+    })
+    .await;
 }

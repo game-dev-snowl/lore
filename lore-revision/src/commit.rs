@@ -31,6 +31,7 @@ use crate::change::FileAction;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::file::dirty::MovedNode;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::InstanceOperation;
@@ -87,6 +88,7 @@ use crate::state::Mark;
 use crate::state::NodeMapping;
 use crate::state::OwnFlags;
 use crate::state::RecordedModifiedTimes;
+use crate::state::Return;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
 use crate::state::StateNodeChildrenWithNameIterator;
@@ -781,21 +783,24 @@ async fn commit_staged_with_layers(
     let link_messages = Arc::new(options.link_messages);
     let layer_messages = Arc::new(options.layer_messages);
 
-    // Snapshot dirty paths before pruning — after the commit, the staged
-    // anchor is rebuilt by replaying these against the new revision, same
-    // pattern as `state::rebase_staged_anchor`.
-    let mut dirty_paths: Vec<RelativePath> = Vec::new();
+    // Snapshot the dirty-only nodes before pruning: after the commit, the staged
+    // anchor is rebuilt from them and the moves the prune returned ([`DirtyOnly`]).
+    let mut dirty = DirtyOnly::default();
     state::collect_dirty_only_paths(
         state_staged.clone(),
         repository.clone(),
         ROOT_NODE,
         RelativePathBuf::new(),
-        &mut dirty_paths,
+        &mut dirty,
     )
     .await
     .forward::<CommitError>("Failed collecting dirty paths from staged state")?;
 
-    lore_debug!("Collected {} dirty paths", dirty_paths.len());
+    lore_debug!(
+        "Collected {} dirty paths and {} dirty marks",
+        dirty.paths.len(),
+        dirty.marks.len()
+    );
 
     // Capture the merge parents now — `finalize_commit` will overwrite
     // `parent_self` with the new revision hash signature, which would prevent us
@@ -803,7 +808,9 @@ async fn commit_staged_with_layers(
     let merge_parent_self = state_staged.parent_self();
     let merge_parent_other = state_staged.parent_other();
 
-    prune_dirty_for_commit(state_staged.clone(), repository.clone()).await?;
+    state_staged.hold_base(state_current.clone());
+    let pruned =
+        prune_dirty_for_commit(state_staged.clone(), repository.clone(), current_revision).await?;
 
     let mut signature = current_revision;
     if current_revision != staged_revision {
@@ -852,38 +859,40 @@ async fn commit_staged_with_layers(
         }
     }
 
-    if !dry_run && signature != current_revision && !dirty_paths.is_empty() {
-        crate::file::dirty::dirty_relative_paths_in_operation(
+    let (dirty_paths, carried) = dirty.carried(pruned);
+    if !dry_run
+        && signature != current_revision
+        && (!dirty_paths.is_empty() || !carried.moves.is_empty() || !carried.marks.is_empty())
+        && let Err(error) = crate::file::dirty::dirty_relative_paths_in_operation(
             operation,
             repository.clone(),
             dirty_paths,
+            Some(&carried),
         )
         .await
-        .forward::<CommitError>("Failed to re-apply dirty paths after commit")?;
+    {
+        lore_warn!(
+            "Committed revision {signature}, but marking its dirty changes again failed, so they \
+             stay unmarked until `lore status --scan` finds them: {error}"
+        );
     }
 
     // Apply any merge dirty-tracking carry. `take_matching` only returns
     // paths when the blob's parents match the merge we just committed, and
     // always clears the blob so a stale carry can't outlive this commit.
-    if !dry_run {
-        let carry = crate::merge_carry::take_matching(
-            repository.clone(),
+    if !dry_run
+        && let Err(error) = apply_merge_carry(
+            operation,
+            &repository,
             merge_parent_self,
             merge_parent_other,
         )
         .await
-        .forward::<CommitError>("Failed reading merge dirty-tracking carry")?;
-        if let Some(paths) = carry
-            && !paths.is_empty()
-        {
-            crate::file::dirty::dirty_relative_paths_in_operation(
-                operation,
-                repository.clone(),
-                paths,
-            )
-            .await
-            .forward::<CommitError>("Failed to apply merge dirty-tracking carry")?;
-        }
+    {
+        lore_warn!(
+            "Committed revision {signature}, but marking the merge's dirty changes failed, so \
+             they stay unmarked until `lore status --scan` finds them: {error}"
+        );
     }
 
     for layer in layers {
@@ -1219,32 +1228,41 @@ async fn commit_link_only(
         })?;
 
     // Resolve the link in both staged and current parent states
-    let resolved_staged = match link::resolve_link_at_path(
-        &state_parent_staged,
-        repository.clone(),
-        &link_path,
-    )
-    .await
-    {
-        Ok(resolved) => resolved,
-        Err(err) if err.is_not_a_link() => {
-            return Err(NotALink { path: link_path }.into());
-        }
-        Err(_) => {
-            return Err(LinkPathNotFound { path: link_path }.into());
-        }
-    };
+    let resolved_staged =
+        link::resolve_link_at_path(&state_parent_staged, repository.clone(), &link_path)
+            .await
+            .map_err(|err| {
+                forward_refusal_or(err, "resolving the staged link at path", |err| {
+                    if err.is_not_a_link() {
+                        CommitError::NotALink(
+                            NotALink {
+                                path: link_path.clone(),
+                            }
+                            .chain_err_from(err, "resolving the staged link at path"),
+                        )
+                    } else {
+                        CommitError::LinkPathNotFound(
+                            LinkPathNotFound {
+                                path: link_path.clone(),
+                            }
+                            .chain_err_from(err, "resolving the staged link at path"),
+                        )
+                    }
+                })
+            })?;
 
     let resolved_current =
         link::resolve_link_at_path(&state_parent_current, repository.clone(), &link_path)
             .await
             .map_err(|err| {
-                CommitError::LinkPathNotFound(
-                    LinkPathNotFound {
-                        path: link_path.clone(),
-                    }
-                    .chain_err_from(err, "resolving link at path"),
-                )
+                forward_refusal_or(err, "resolving link at path", |err| {
+                    CommitError::LinkPathNotFound(
+                        LinkPathNotFound {
+                            path: link_path.clone(),
+                        }
+                        .chain_err_from(err, "resolving link at path"),
+                    )
+                })
             })?;
 
     let link_staged_revision = resolved_staged.link_node.linked_node().revision;
@@ -1535,7 +1553,9 @@ async fn build_commit_metadata(
 ///
 /// `reconciling` is the operation the commit read its files through, `None` for a link's own
 /// commit, which makes no revision of the instance current. Outside a dry run, where its provider
-/// holds its state, it is handed `state_staged` as stored once the revision is current
+/// holds its state, it owes the provider's settle from before the revision may become current
+/// ([`InstanceOperationImpl::owe_settle`]), released at once where the branch's latest was not
+/// stored, and is handed `state_staged` as stored once the revision is current
 /// ([`hand_over_committed`]), before it is reused as the staged anchor.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_commit(
@@ -1551,13 +1571,28 @@ async fn finalize_commit(
     let dry_run = execution_context().globals().dry_run();
 
     if !dry_run {
-        store_branch_latest_and_make_current(
+        if let Some(operation) = reconciling {
+            operation.owe_settle().await;
+        }
+        // The halves of `store_branch_latest_and_make_current`, apart: only a failure of the
+        // first leaves nothing current, so no settle owed.
+        if let Err(error) = branch::store_latest(
             repository.clone(),
+            branch,
             branch_previous,
             signature,
-            branch,
+            BranchLatestStatus::Divergent,
         )
-        .await?;
+        .await
+        {
+            if let Some(operation) = reconciling {
+                operation.release_settle_owed();
+            }
+            return Err(error).forward::<CommitError>("Failed to store current branch latest");
+        }
+        crate::instance::store_current_anchor(&repository, signature)
+            .await
+            .forward::<CommitError>("Failed to serialize current revision anchor")?;
         if let Some(operation) = reconciling
             && operation.holds_state()
             && let Err(error) = hand_over_committed(&repository, operation, state_staged).await
@@ -1613,16 +1648,20 @@ async fn finalize_commit(
 
 /// Hands `committed` to `operation`, whose provider holds its state, once the stores are flushed
 /// ([`InstanceOperation::committed`]). The provider may then drop the copies it kept of the files
-/// the commit read, which only a revision on disk replaces after a crash.
+/// the commit read, which only a revision on disk replaces after a crash. A failed flush drops the
+/// blocks kept for the settle ([`InstanceOperationImpl::keep_serialized_blocks`]).
 async fn hand_over_committed(
     repository: &Arc<RepositoryContext>,
     operation: &InstanceOperationImpl,
     committed: &Arc<State>,
 ) -> Result<(), CommitError> {
-    repository
-        .flush(execution_context().globals().sync_data())
+    if let Err(error) = repository
+        .flush(execution_context().globals().flush_options())
         .await
-        .forward_any::<CommitError>("flushing the commit")?;
+    {
+        operation.drop_serialized_blocks();
+        return Err(error).forward_any::<CommitError>("flushing the commit");
+    }
     operation
         .committed(repository.clone(), committed.clone())
         .await
@@ -1655,7 +1694,7 @@ async fn layer_commit_root(
     if !node_link.is_valid() {
         return Err(CommitError::internal("Invalid subpath"));
     }
-    if node_link.repository != repository.id {
+    if node_link.crosses_link(repository, state_staged) {
         // TODO(mjansson): Layers that specify a path living inside a link need
         //                 special snowflake care here to commit from the link and down
         return Err(CommitError::internal("Not supported"));
@@ -1695,7 +1734,8 @@ async fn commit_staged_revision(
         }
     }
 
-    prune_dirty_for_commit(state_staged.clone(), repository.clone()).await?;
+    state_staged.hold_base(state_current.clone());
+    prune_dirty_for_commit(state_staged.clone(), repository.clone(), revision_current).await?;
 
     // Per-operation tracker for background fragment uploads. Write-producing
     // calls below dispatch leader tasks into it; await_all drains every
@@ -1715,8 +1755,10 @@ async fn commit_staged_revision(
         // For each file in repository, create fragments if they don't already
         // exist. Also rehash directories affected by change and generate new
         // root hash.
+        // A clone: the block's own reference serves the serialize below, so no second slot holds
+        // one across the walk's await.
         commit_files_and_rehash(
-            operation,
+            operation.clone(),
             repository.clone(),
             token.share(),
             state_staged.clone(),
@@ -1782,9 +1824,11 @@ async fn commit_staged_revision(
             .await
             .forward::<CommitError>("Failed to free the detached slots")?;
 
-        // Serialize the new current state
+        // Serialize the new current state, its fresh blocks kept for the provider's settle
         let signature = state_staged
-            .serialize(repository.clone(), &token)
+            .serialize_keeping(repository.clone(), &token, |written| {
+                operation.keep_serialized_blocks(written);
+            })
             .await
             .forward::<CommitError>("Failed to serialize revision state")?;
 
@@ -1848,7 +1892,9 @@ pub async fn store_branch_latest_and_make_current(
 /// `operation` is the caller's, covering the whole working tree the files are read from, links
 /// and layers included: their paths are the parent's and so is their filesystem. A file the
 /// state holds as a resolved merge conflict has the copies that merge left beside it removed,
-/// so the operation is one finalized as having changed the filesystem.
+/// so the operation is one finalized as having changed the filesystem. Where its provider holds
+/// its state, it is handed each directory the walk adds or moves
+/// ([`InstanceOperationImpl::hand_directory`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_files_and_rehash(
     operation: Arc<InstanceOperationImpl>,
@@ -1892,6 +1938,7 @@ pub(crate) async fn commit_files_and_rehash(
     let discover_stats = stats.clone();
     let producer = {
         let walk = Arc::new(CommitWalk {
+            hands_directories: operation.holds_state(),
             operation: operation.clone(),
             repository: repository.clone(),
             token: token.share(),
@@ -2046,6 +2093,9 @@ fn reject_unresolved_conflict(node: &Node, path: &str) -> Result<(), CommitError
 /// What every directory of a commit walk reads and writes.
 #[lore_macro::test_pub]
 struct CommitWalk {
+    /// Whether each directory the walk adds or moves goes to `operation`
+    /// ([`InstanceOperationImpl::hand_directory`]): a link's walk keeps its own.
+    hands_directories: bool,
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
@@ -2137,7 +2187,8 @@ struct CommitFrame {
 
 impl CommitFrame {
     /// Enters the staged directory `node_id` at `relative_path`, adding the directory to the delta
-    /// when it is staged itself.
+    /// when it is staged itself, and handing it to the walk's operation when it is staged added
+    /// or moved.
     async fn enter(
         walk: &CommitWalk,
         relative_path: RelativePath,
@@ -2159,6 +2210,9 @@ impl CommitFrame {
             );
             if node.is_staged() {
                 delta_add(walk.delta.clone(), node_id, node.flags);
+                if walk.hands_directories && (node.is_staged_add() || node.is_staged_move()) {
+                    walk.operation.hand_directory(&relative_path);
+                }
             }
         }
         let children = StateNodeChildrenWithNameIterator::new(
@@ -2563,9 +2617,45 @@ async fn info_before_fragmenting(
     Ok(info)
 }
 
+/// Whether a commit takes the content of the staged file `node` at `path` from the node rather
+/// than from the working tree: where a merge staged the file and the view excludes the path,
+/// unless a forced stage took the file from the working tree since. A sparse working tree holds no
+/// file at such a path, or a stale one, so the commit neither reads it nor looks for conflict
+/// markers in it.
+///
+/// A forced stage of such a file resolves the merge with the working tree's file: it drops the
+/// node's content hash, taking the working tree's size, keeping the file ID and the merge bits
+/// ([`crate::stage::stage_node_from_metadata`]). A zero hash with a nonzero size is content not
+/// yet stored, the state a newly staged add has, which the commit reads from the working tree. A
+/// zero hash with size 0 is an empty file, taken from the staged node as it stands: a merge stages
+/// one that way, and so does a forced stage of an empty working-tree file.
+pub(crate) fn takes_staged_content(
+    repository: &RepositoryContext,
+    path: &RelativePath,
+    node: &Node,
+) -> bool {
+    !(node.address.is_zero() && node.size != 0) && merged_past_the_view(repository, path, node)
+}
+
+/// Whether a merge staged the file `node` at `path` and the view excludes the path, whatever
+/// content the node holds.
+///
+/// The view test must stay identical to the one realize gates disk writes on (`fs/realize.rs`),
+/// because that is what decided whether the file was written.
+pub(crate) fn merged_past_the_view(
+    repository: &RepositoryContext,
+    path: &RelativePath,
+    node: &Node,
+) -> bool {
+    node.is_staged_merge()
+        && repository
+            .filter
+            .excludes_tree(path, false, FilterMode::View)
+}
+
 /// Commits one file node, recording the modified time it read the file at and telling the
-/// operation what it stored ([`InstanceOperation::stored`]). A view-excluded path records and
-/// tells nothing: its content is taken from the staged node rather than disk.
+/// operation what it stored ([`InstanceOperation::stored`]). A file whose content is taken from
+/// the staged node ([`takes_staged_content`]) records and tells nothing.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -2591,20 +2681,11 @@ fn commit_file(
 
         debug_assert!(node.is_file());
 
-        // A sparse checkout has no working-tree file for a view-excluded path, so
-        // the staged content hash is the only source and no markers are read.
-        // Re-fragmenting would read a file that is absent or stale.
-        //
-        // This test must stay identical to the one realize gates disk writes on
-        // (`fs/realize.rs`), because that is what decided whether the file was
-        // written.
-        let excluded = repository
-            .filter
-            .excludes_tree(&relative_path, false, FilterMode::View);
+        let staged_content = takes_staged_content(&repository, &relative_path, &node);
 
         if node.is_staged_merge_conflict() {
             reject_unresolved_conflict(&node, relative_path.as_str())?;
-            if !excluded
+            if !staged_content
                 && operation
                     .infer_is_conflicted(&relative_path)
                     .await
@@ -2629,7 +2710,7 @@ fn commit_file(
             node.flags
         );
 
-        let (address, content_size, mode, modified_time) = if excluded {
+        let (address, content_size, mode, modified_time) = if staged_content {
             (node.address, node.size, node.mode, None)
         } else {
             if node.address.context.is_zero() {
@@ -2650,22 +2731,29 @@ fn commit_file(
                 .forward_with::<CommitError, _>(|| {
                     format!("naming the content of {relative_path}")
                 })?;
-            let (address, size_content) = immutable::write_from_file_with_tracker(
-                repository.clone(),
-                &source,
-                node.address.context,
-                immutable::write_options_from_repository(repository.clone()),
-                Some(tracker),
-            )
-            .await
-            .forward_with::<CommitError, _>(|| {
-                format!(
-                    "Failed writing file {} to immutable store",
-                    relative_path.as_str()
-                )
-            })?;
-
-            stats.file_read(size_content);
+            // Content a virtual filesystem serves from the immutable store is stored already,
+            // under the address it names, so it is taken as it is rather than read back.
+            let (address, size_content) =
+                if let Some(stored) = immutable::virtual_immutable(&source) {
+                    stored
+                } else {
+                    let written = immutable::write_from_file_with_tracker(
+                        repository.clone(),
+                        &source,
+                        node.address.context,
+                        immutable::write_options_from_repository(repository.clone()),
+                        Some(tracker),
+                    )
+                    .await
+                    .forward_with::<CommitError, _>(|| {
+                        format!(
+                            "Failed writing file {} to immutable store",
+                            relative_path.as_str()
+                        )
+                    })?;
+                    stats.file_read(written.1);
+                    written
+                };
             let mode = info.mode(node.mode);
             operation.stored(&relative_path, address, size_content, mode);
 
@@ -2897,7 +2985,8 @@ async fn commit_link(
 
     lore_debug!("Committing link node {node_id} at {relative_path}");
 
-    prune_dirty_for_commit(state.clone(), repository.clone()).await?;
+    let base = state.committed_revision();
+    prune_dirty_for_commit(state.clone(), repository.clone(), base).await?;
     let link_modified_times = Arc::new(RecordedModifiedTimes::below(
         operation.clock_floor(&repository).await,
     ));
@@ -2934,6 +3023,7 @@ async fn commit_link(
 
             let producer = {
                 let walk = Arc::new(CommitWalk {
+                    hands_directories: false,
                     operation: operation.clone(),
                     repository: repository.clone(),
                     token: token.share(),
@@ -3227,7 +3317,7 @@ pub async fn rehash_directory(
             name: name_end - child_node.name_length..name_end,
         };
 
-        if child_node.is_directory() {
+        if child_node.is_directory() && child_node.is_staged() {
             lore_trace!("Spawning rehash of directory node {}", child_node_id);
             let index = child_data.len() as u32;
             child_data.push(child);
@@ -3270,7 +3360,7 @@ pub async fn rehash_directory(
             }
 
             lore_trace!(
-                "File node {} mode 0o{:o} size {} flags 0x{:x} address {}",
+                "Child node {} mode 0o{:o} size {} flags 0x{:x} address {}",
                 child_node_id,
                 child_node.mode,
                 child_node.size,
@@ -3894,10 +3984,7 @@ async fn node_at_path(
         Err(state::StateError::NodeNotFound(_)) => return Ok(None),
         Err(error) => return Err(error),
     };
-    if !node_link.node.is_valid_node_id()
-        || node_link.repository != repository.id
-        || node_link.revision != state.revision()
-    {
+    if !node_link.is_valid() || node_link.crosses_link(repository, state) {
         return Ok(None);
     }
     Ok(Some(node_link.node))
@@ -4014,50 +4101,102 @@ pub async fn prepare_commit_metadata(
     Ok(Arc::new(metadata))
 }
 
-/// Discard dirty-only-add subtrees and clear dirty flags on every other
-/// dirty-only node before the commit pipeline builds the new revision.
+/// Marks the paths a merge's dirty-tracking carry holds dirty, where its parents are
+/// `merge_parent_self` and `merge_parent_other`; the carry is cleared either way.
+async fn apply_merge_carry(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    merge_parent_self: Hash,
+    merge_parent_other: Hash,
+) -> Result<(), CommitError> {
+    let carry = crate::merge_carry::take_matching(
+        repository.clone(),
+        merge_parent_self,
+        merge_parent_other,
+    )
+    .await
+    .forward::<CommitError>("Failed reading merge dirty-tracking carry")?;
+    if let Some(paths) = carry
+        && !paths.is_empty()
+    {
+        crate::file::dirty::dirty_relative_paths_in_operation(
+            operation,
+            repository.clone(),
+            paths,
+            None,
+        )
+        .await
+        .forward::<CommitError>("Failed to apply merge dirty-tracking carry")?;
+    }
+    Ok(())
+}
+
+/// Discard dirty-only-add subtrees, return dirty-only moves to the place `base` holds them at,
+/// and clear dirty flags on every other dirty-only node before the commit pipeline builds the
+/// new revision, so it holds `base` with the staged changes and nothing else. A dirty-only move a
+/// staged change displaces leaves the tree, as it cannot go back. `base` is the revision the
+/// staged tree shares its node IDs with, the one it was built on or loaded from. Answers each
+/// dirty-only move, gone back or left out, with the path the staged tree held its node at, in the
+/// order the walk left them: each before the moves of the directories above it.
+///
+/// A dirty-only directory that holds a staged node is staged with it, as staging the node there
+/// would have staged it, so the revision takes the directory where the staged tree holds it, a
+/// move or an add with it, and none of its staged nodes is moved or discarded. A directory a
+/// staged node left, which a dirty move takes it from without staging the directory, is staged
+/// once the moves settle, so the commit rehashes it without that node ([`stage_left`]).
 ///
 /// `state_staged` doubles as the source tree for the new committed revision
 /// and the carrier of staged-anchor tracking. Dirty-only nodes belong only to
 /// the latter — they were marked by `lore dirty <path>` (or `lore status
 /// --scan`) but never staged, so the committed merkle tree must not reference
 /// them. After pruning, the staged tracking is rebuilt against the new
-/// committed revision by re-running `file::dirty::dirty()` on the dirty paths
-/// captured beforehand (mirroring `state::rebase_staged_anchor`).
+/// committed revision by marking the returned moves again, marking each other
+/// node with the dirty marks it carried, and re-running `file::dirty::dirty()`
+/// on the paths of the adds and deletions captured beforehand.
 ///
 /// The walk is post-order, so empty intermediate directories can collapse
-/// upward after their dirty-add children have already been removed. It is a
+/// upward after their dirty-add children have already been removed, and a move
+/// below a moved directory returns before the directory does. Moves that wait
+/// for another to go first settle after the walk ([`settle_waiting`]). It is a
 /// loop over a stack of the nodes entered and not yet left rather than a
 /// recursion, so no node is boxed and the thread's stack does not grow with the
 /// tree's depth.
 ///
-/// Only dirty children are descended into: `node_mark` propagates the
-/// base Dirty bit up to the root, so a clean child cannot have dirty
-/// descendants (the same invariant `collect_dirty_paths` walks by). Clean
-/// subtrees are untouched — in particular a clean committed empty directory
-/// is no longer visited, so the empty-directory collapse only applies to
-/// directories on dirty paths.
+/// Only dirty children are descended into: `node_mark` propagates the base Dirty bit to every
+/// directory above the node but the root, so a clean child cannot have dirty descendants (the
+/// same invariant `collect_dirty_paths` walks by). Clean subtrees are untouched, so the
+/// empty-directory collapse only applies to directories on dirty paths. A staged node is seen
+/// among the children read whether or not it is dirty.
 pub(crate) async fn prune_dirty_for_commit(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
-) -> Result<(), CommitError> {
+    base: Hash,
+) -> Result<Pruned, CommitError> {
     let root = state
         .block(repository.clone(), NodeBlock::index(ROOT_NODE))
         .await
         .forward::<CommitError>("Failed deserializing state block")?;
     let mut levels = vec![PruneLevel::new(ROOT_NODE, root)];
+    let mut context = PruneContext {
+        base,
+        returned: Vec::new(),
+        waiting: Vec::new(),
+        left: Vec::new(),
+        name: String::new(),
+    };
     while let Some(child_id) = levels.last().map(|level| level.next_child) {
         if child_id.is_valid_node_id() {
             let child_block = state
                 .block(repository.clone(), NodeBlock::index(child_id))
                 .await
                 .forward::<CommitError>("Failed deserializing state block")?;
-            let (next_sibling, child_is_dirty) = {
+            let (next_sibling, child_is_dirty, child_is_staged) = {
                 let child = child_block.node(Node::index(child_id));
-                (child.sibling, child.is_dirty())
+                (child.sibling, child.is_dirty(), child.is_staged())
             };
             if let Some(level) = levels.last_mut() {
                 level.next_child = next_sibling;
+                level.holds_staged |= child_is_staged;
             }
             if child_is_dirty {
                 levels.push(PruneLevel::new(child_id, child_block));
@@ -4066,14 +4205,64 @@ pub(crate) async fn prune_dirty_for_commit(
         }
 
         let Some(level) = levels.pop() else { break };
-        let node_id = level.node_id;
-        if prune_dirty_leave(&state, &repository, level).await?
-            && let Some(parent) = levels.last_mut()
-        {
-            parent.to_discard.push(node_id);
+        let (node_id, holds_staged) = (level.node_id, level.holds_staged);
+        let discard = prune_dirty_leave(&state, &repository, level, &mut context).await?;
+        if let Some(parent) = levels.last_mut() {
+            parent.holds_staged |= holds_staged;
+            if discard {
+                parent.to_discard.push(node_id);
+            }
         }
     }
-    Ok(())
+    settle_waiting(&state, &repository, &mut context).await?;
+    stage_left(&state, &repository, &mut context.left).await?;
+    Ok(Pruned {
+        moves: context.returned,
+    })
+}
+
+/// The dirty-only nodes a commit marks again past it, as [`state::collect_dirty_only_paths`] finds
+/// them.
+#[derive(Default)]
+struct DirtyOnly {
+    /// The path of each node marked dirty as added or deleted, which the commit marks again as the
+    /// working tree holds it, or found through a link.
+    paths: Vec<RelativePath>,
+    /// Each other node of the tree, with its flags, which the revision holds where the tree does or
+    /// a move left out takes back, and which keeps the dirty marks it carries.
+    marks: Vec<(NodeID, NodeFlags)>,
+}
+
+impl state::DirtyPathSink for DirtyOnly {
+    const THROUGH_MOVES: bool = true;
+
+    fn record(&mut self, path: &RelativePathBuf, id: NodeID, node: &Node, linked: bool) {
+        if linked || node.is_dirty_add() || node.is_dirty_delete() {
+            self.paths.push(path.clone().freeze());
+        } else {
+            self.marks
+                .push((id, NodeFlags::from_bits_retain(node.flags)));
+        }
+    }
+}
+
+impl DirtyOnly {
+    /// The paths to mark again past the commit, and the marks carried beside them, once the prune
+    /// left out the moves of `pruned`.
+    fn carried(self, pruned: Pruned) -> (Vec<RelativePath>, crate::file::dirty::CarriedMarks) {
+        let carried = crate::file::dirty::CarriedMarks {
+            moves: pruned.moves,
+            marks: self.marks,
+        };
+        (self.paths, carried)
+    }
+}
+
+/// What [`prune_dirty_for_commit`] answers.
+pub(crate) struct Pruned {
+    /// Each dirty-only move, gone back or left out, with the path the staged tree held its node at,
+    /// in the order the walk left them.
+    pub moves: Vec<MovedNode>,
 }
 
 /// A dirty node [`prune_dirty_for_commit`] has entered and not yet left.
@@ -4085,6 +4274,10 @@ struct PruneLevel {
     next_child: NodeID,
     /// The children found to be discarded, in the order visited.
     to_discard: Vec<NodeID>,
+    /// Whether a staged node lies below it.
+    holds_staged: bool,
+    /// Whether it was staged when entered.
+    entered_staged: bool,
 }
 
 impl PruneLevel {
@@ -4095,34 +4288,62 @@ impl PruneLevel {
         } else {
             INVALID_NODE
         };
+        let entered_staged = node.is_staged();
         Self {
             node_id,
             block,
             next_child,
             to_discard: Vec::new(),
+            holds_staged: false,
+            entered_staged,
         }
     }
 }
 
+/// What [`prune_dirty_for_commit`] carries from node to node.
+struct PruneContext {
+    /// The revision the staged tree shares its node IDs with.
+    base: Hash,
+    /// Each dirty-only move, with the path the staged tree held its node at, in the order the walk
+    /// left them: gone back, waiting to, or left out of the tree.
+    returned: Vec<MovedNode>,
+    /// The node of each dirty-only move waiting to go back ([`Return::Parked`]), in the order it
+    /// came to wait.
+    waiting: Vec<NodeID>,
+    /// The directory the base revision holds each staged node in that this tree holds in another.
+    left: Vec<NodeID>,
+    /// The buffer each committed name is read into.
+    name: String,
+}
+
 /// Leaves a node of [`prune_dirty_for_commit`] once its children have been: discards the
-/// children found to be discarded, each with its subtree, clears its dirty flags unless it is an
-/// unstaged dirty add to be discarded, and returns `true` when its parent should discard it.
+/// children found to be discarded, each with its subtree, returns it to the place the base
+/// revision holds it at where it is an unstaged dirty move ([`State::node_return_unstaged_move`]),
+/// recording it in `context`, clears its dirty flags unless it is an unstaged dirty add to be
+/// discarded, and returns `true` when its parent should discard it. A node that was not staged and
+/// holds a staged node is staged first, its ancestors with it, as staging that node would have
+/// staged it ([`stage_holder`]).
 ///
 /// `clear_dirty_flags` preserves Staged and the action bits when Staged is set,
 /// so clearing both restores dirty-only nodes and strips a stale Dirty
 /// propagation bit that `rehash_directory` would otherwise leave on a staged
 /// parent. An intermediate directory created solely to host dirty-add children
 /// is discarded once emptied, so the parent's rehash does not pull in an
-/// orphaned dirty-only directory.
+/// orphaned dirty-only directory. An empty directory the base revision holds stays: a commit
+/// takes no deletion that was not staged. Only such a directory reads the base revision for it,
+/// so that read is boxed.
 async fn prune_dirty_leave(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
     level: PruneLevel,
+    context: &mut PruneContext,
 ) -> Result<bool, CommitError> {
     let PruneLevel {
         node_id,
         block,
         to_discard,
+        holds_staged,
+        entered_staged,
         ..
     } = level;
     for discard_id in to_discard {
@@ -4131,36 +4352,183 @@ async fn prune_dirty_leave(
             .forward::<CommitError>("Failed discarding dirty node")?;
     }
 
-    let node_index = Node::index(node_id);
     let is_root = node_id == ROOT_NODE;
-    let (is_staged, is_dirty_add, is_dirty, is_dir_now, child_now, link) = {
-        let node = block.node(node_index);
+    let (flags, child_now, link, parent) = {
+        let node = block.node(Node::index(node_id));
         (
-            node.is_staged(),
-            node.is_dirty_add(),
-            node.is_dirty(),
-            node.is_directory(),
+            NodeFlags::from_bits_retain(node.flags),
             node.child,
             node.is_link().then(|| node.linked_node()),
+            node.parent,
         )
     };
+    let is_staged = flags.contains(NodeFlags::Staged) || holds_staged;
+    if is_staged
+        && !is_root
+        && let Some(left) = state
+            .base_parent(repository, context.base, node_id)
+            .await
+            .forward::<CommitError>("Failed reading the revision the staged tree was built on")?
+        && left != parent
+        && left != ROOT_NODE
+    {
+        context.left.push(left);
+    }
+    if holds_staged && !entered_staged && !is_root {
+        Box::pin(stage_holder(state, repository, node_id)).await?;
+    }
 
-    if !is_staged && is_dirty_add && !is_root {
+    if !is_staged && flags.contains(NodeFlags::DirtyAdd) && !is_root {
         return Ok(true);
     }
 
-    if is_dirty {
+    if !is_staged
+        && flags.contains(NodeFlags::DirtyMove)
+        && !is_root
+        && return_unstaged_move(state, repository, context, node_id, flags).await?
+    {
+        return Ok(true);
+    }
+
+    if flags.contains(NodeFlags::Dirty) {
         if let Some(link) = link.filter(|_| !is_staged) {
             restore_committed_link_pin(state, repository, node_id, link).await?;
         }
         state.node_clear_own(&block, node_id, OwnFlags::Dirty);
     }
 
-    if is_staged {
+    if is_staged
+        || flags.intersects(NodeFlags::File | NodeFlags::Link)
+        || child_now.is_valid_node_id()
+        || is_root
+    {
         return Ok(false);
     }
 
-    Ok(is_dir_now && !child_now.is_valid_node_id() && !is_root)
+    let tracked = Box::pin(state.base_holds(repository, context.base, node_id, flags.node_type()))
+        .await
+        .forward::<CommitError>("Failed reading the revision the staged tree was built on")?;
+    Ok(!tracked)
+}
+
+/// Stages `node`, which holds a staged node, its ancestors with it. Boxed by its caller, as only
+/// such a node takes it.
+async fn stage_holder(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node: NodeID,
+) -> Result<(), CommitError> {
+    state
+        .node_mark(repository, node, Mark::staged(NodeFlags::Staged, false))
+        .await
+        .forward::<CommitError>("Failed staging a directory that holds a staged node")
+}
+
+/// Returns `node_id`, carrying `flags`, a move marked dirty and not staged, to the place the base
+/// revision holds it at, as [`State::node_return_unstaged_move`] does, recording it in `context`,
+/// and as waiting where it waits; answers `true` where its parent is to discard it, as it cannot
+/// go back.
+async fn return_unstaged_move(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    context: &mut PruneContext,
+    node_id: NodeID,
+    flags: NodeFlags,
+) -> Result<bool, CommitError> {
+    let (returned, path) = state
+        .node_return_unstaged_move(repository, context.base, node_id, &mut context.name, true)
+        .await
+        .forward::<CommitError>("Failed returning an unstaged move")?;
+    let moved = path.map(|path| MovedNode {
+        node: node_id,
+        node_type: flags.node_type(),
+        path,
+    });
+    if returned == Return::Parked {
+        context.waiting.push(node_id);
+    }
+    context.returned.extend(moved);
+    Ok(returned == Return::Displaced)
+}
+
+/// Settles the moves [`prune_dirty_for_commit`] left waiting, once its walk has discarded every
+/// dirty add it does not stage: each goes back where nothing keeps it now, in the reverse of the
+/// order they came to wait, so a chain the walk met from its first move settles in one pass, and
+/// passes repeat while one settles. One that a staged node displaces leaves the tree with its
+/// subtree, as it cannot go back, a directory marked dirty as added and staged for a staged node it
+/// holds among them; so does one gone with a directory the walk discarded. Where a pass settles
+/// none, the last to wait leaves the tree, so what is left settles.
+async fn settle_waiting(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    context: &mut PruneContext,
+) -> Result<(), CommitError> {
+    while !context.waiting.is_empty() {
+        let mut settled = false;
+        let mut index = context.waiting.len();
+        while index > 0 {
+            index -= 1;
+            let node = context.waiting[index];
+            let (returned, _) = state
+                .node_return_unstaged_move(repository, context.base, node, &mut context.name, false)
+                .await
+                .forward::<CommitError>("Failed returning an unstaged move")?;
+            match returned {
+                Return::Parked => continue,
+                Return::Displaced => discard_displaced(state, repository, node).await?,
+                Return::Stays | Return::Back | Return::Gone => {}
+            }
+            context.waiting.remove(index);
+            settled = true;
+        }
+        if !settled && let Some(node) = context.waiting.pop() {
+            discard_displaced(state, repository, node).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Stages each of `left`, a directory the base revision holds a staged node in that the tree holds
+/// in another, where the tree still holds it, with its ancestors: its children in the revision
+/// differ from the base revision's, so the commit rehashes it. Runs once the moves settle, so the
+/// mark climbs from where each directory stands in the revision.
+async fn stage_left(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    left: &mut Vec<NodeID>,
+) -> Result<(), CommitError> {
+    left.sort_unstable();
+    left.dedup();
+    for directory in left.iter() {
+        let live = !state
+            .node(repository.clone(), *directory)
+            .await
+            .forward::<CommitError>("Failed reading a directory a staged node left")?
+            .is_discarded();
+        if live {
+            state
+                .node_mark(
+                    repository,
+                    *directory,
+                    Mark::staged(NodeFlags::Staged, false),
+                )
+                .await
+                .forward::<CommitError>("Failed staging a directory a staged node left")?;
+        }
+    }
+    Ok(())
+}
+
+/// Discards `node`, a move that cannot go back, with its subtree.
+async fn discard_displaced(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node: NodeID,
+) -> Result<(), CommitError> {
+    state::node_discard_fused(state.clone(), repository.clone(), node)
+        .await
+        .forward::<CommitError>("Failed discarding an unstaged move")?;
+    Ok(())
 }
 
 async fn restore_committed_link_pin(
@@ -4434,6 +4802,7 @@ pub async fn commit_in_memory_revision(
         freeze_in_memory_tree(
             work_repository.clone(),
             state_staged.clone(),
+            current_revision,
             stats.clone(),
             work_tracker.clone(),
         )
@@ -4583,16 +4952,61 @@ async fn has_staged_children(
     }
 }
 
-/// Freeze the staged tree into the shape a revision records: dirty tracking
-/// pruned, staged deletions discarded, staged files and links cleared of their
-/// change flags, every affected directory rehashed, and the node delta written.
+/// Freeze the staged tree into the shape a revision records, as [`freeze_tree`] does against
+/// `base`, the revision the tree was loaded from, and write the node delta.
 async fn freeze_in_memory_tree(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
+    base: Hash,
     stats: Arc<CommitStats>,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
 ) -> Result<(), CommitError> {
-    prune_dirty_for_commit(state.clone(), repository.clone()).await?;
+    let delta = freeze_tree(repository.clone(), state.clone(), base, stats).await?;
+    generate_delta_block(repository, state, delta, tracker).await
+}
+
+/// Applies `changes`, the conflict-free changes of a 3-way diff, to `state`, the tree of the
+/// revision they merge onto, and freezes the result into the tree a revision records: nodes staged
+/// for deletion discarded, change flags cleared and every changed directory rehashed. The state
+/// keeps the delta block it was loaded with.
+pub async fn merge_tree_changes(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    changes: &[change::NodeChange],
+) -> Result<(), CommitError> {
+    let base = state.committed_revision();
+    state::apply_tree_changes(repository.clone(), state.clone(), changes)
+        .await
+        .forward_any::<CommitError>("applying the merged changes")?;
+    freeze_tree(repository, state, base, CommitStats::new()).await?;
+    Ok(())
+}
+
+/// Freeze a staged tree whose every leaf carries its address into the shape a revision records:
+/// dirty tracking pruned against `base`, the revision the tree shares its node IDs with, staged
+/// deletions discarded, staged files and links cleared of their change flags and every affected
+/// directory rehashed. Answers the node delta of the changes.
+///
+/// Only a tree holding a dirty mark takes the prune, boxed: every dirty mark marks a child of the
+/// root, and no mark the root itself. The tree a merge applies its changes to holds none.
+async fn freeze_tree(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    base: Hash,
+    stats: Arc<CommitStats>,
+) -> Result<Arc<parking_lot::RwLock<BytesMut>>, CommitError> {
+    let dirty = state
+        .node_has_dirty_children(repository.clone(), ROOT_NODE)
+        .await
+        .forward::<CommitError>("Failed reading the children of the staged tree's root")?;
+    if dirty {
+        Box::pin(prune_dirty_for_commit(
+            state.clone(),
+            repository.clone(),
+            base,
+        ))
+        .await?;
+    }
 
     let delta = Arc::new(parking_lot::RwLock::new(BytesMut::new()));
     let discard = Arc::new(parking_lot::RwLock::new(vec![]));
@@ -4635,11 +5049,11 @@ async fn freeze_in_memory_tree(
     rehash_directory(repository.clone(), state.clone(), ROOT_NODE).await?;
 
     state
-        .update_tree_root_hash(repository.clone())
+        .update_tree_root_hash(repository)
         .await
         .forward::<CommitError>("Failed to update tree root hash")?;
 
-    generate_delta_block(repository, state, delta, tracker).await
+    Ok(delta)
 }
 
 /// Walk the staged directories under `node_id`, depth first in child order, each directory's files

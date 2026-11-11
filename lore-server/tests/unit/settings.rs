@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::fs;
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use lore_revision::cluster::peer::Locality;
+use lore_revision::store::composite::ReadReplicaSelection;
 use lore_server::plugins::PluginRegistry;
 use lore_server::settings::*;
 use lore_server::store::resolve_plugin_config_with_fallback;
@@ -53,6 +56,29 @@ fn server_settings_default_the_local_store_monitor_table() {
         server.local_store_monitor.low_space_threshold_bytes,
         TEN_GIB
     );
+}
+
+/// A `remote` store opens four storage connections to its upstream unless `[server]` names another
+/// count.
+#[test]
+fn server_settings_default_four_upstream_connections() {
+    let default: ServerSettings = toml::from_str("").expect("[server] with no keys");
+    let named: ServerSettings =
+        toml::from_str("upstream_connections = 2").expect("[server] naming a count");
+
+    assert_eq!(default.upstream_connections, 4);
+    assert_eq!(named.upstream_connections, 2);
+}
+
+/// Each socket limit that `[server.uds]` does not name takes its default.
+#[test]
+fn uds_settings_default_limits_of_their_own() {
+    let uds: UdsSettings = toml::from_str("enabled = true").expect("[server.uds] with defaults");
+
+    assert_eq!(uds.credits, 4000);
+    assert_eq!(uds.credit_bytes, 256 * 1024 * 1024);
+    assert_eq!(uds.max_connections_per_socket, 64);
+    assert_eq!(uds.socket_bytes, 1024 * 1024 * 1024);
 }
 
 #[test]
@@ -1237,6 +1263,55 @@ fn test_hook_settings_disabled_by_default() {
 }
 
 #[test]
+fn composite_read_replica_selection_reads_each_mode() {
+    for (config, selection) in [
+        (
+            "local.mode = \"local\"\nread_replica_selection = \"fan_out\"",
+            ReadReplicaSelection::FanOut,
+        ),
+        (
+            "local.mode = \"local\"\nread_replica_selection = \"round_robin\"",
+            ReadReplicaSelection::RoundRobin,
+        ),
+    ] {
+        let settings: CompositeStoreSettings =
+            toml::from_str(config).expect("composite settings should deserialize");
+        assert_eq!(settings.read_replica_selection, Some(selection));
+    }
+}
+
+#[test]
+fn composite_read_replica_selection_rejects_an_unknown_mode() {
+    let result: Result<CompositeStoreSettings, _> =
+        toml::from_str("local.mode = \"local\"\nread_replica_selection = \"random\"");
+    assert!(result.is_err());
+}
+
+#[test]
+fn composite_round_robin_tries_are_read() {
+    let settings: CompositeStoreSettings = toml::from_str(
+        "local.mode = \"local\"\nround_robin_max_tries = 3\nround_robin_try_limit_ms = 25",
+    )
+    .expect("composite settings should deserialize");
+    assert_eq!(settings.round_robin_max_tries, NonZeroUsize::new(3));
+    assert_eq!(settings.round_robin_try_limit_ms, NonZeroU64::new(25));
+}
+
+#[test]
+fn composite_round_robin_max_tries_rejects_zero() {
+    let result: Result<CompositeStoreSettings, _> =
+        toml::from_str("local.mode = \"local\"\nround_robin_max_tries = 0");
+    assert!(result.is_err());
+}
+
+#[test]
+fn composite_round_robin_try_limit_rejects_zero() {
+    let result: Result<CompositeStoreSettings, _> =
+        toml::from_str("local.mode = \"local\"\nround_robin_try_limit_ms = 0");
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_settings_with_lock_store() {
     let config = r#"
             [server]
@@ -2239,6 +2314,68 @@ mod deserialize_quic_internal {
             toml::from_str("").expect("[server] with no tables should deserialize");
 
         assert!(server.quic_internal.is_none());
+    }
+}
+
+mod replicated_store_settings_num_clients {
+    use super::*;
+
+    pub(super) const REQUIRED_KEYS: &str = r#"
+        remote_url = "lore://127.0.0.1:41340"
+        periodic_client_refresh_secs = 300
+
+        [regenerate_retry]
+        initial_backoff_ms = 250
+        max_backoff_ms = 10_000
+        max_attempts = 5
+    "#;
+
+    fn parse(num_clients: &str) -> Result<ReplicatedStoreSettings, toml::de::Error> {
+        toml::from_str(&format!("{num_clients}\n{REQUIRED_KEYS}"))
+    }
+
+    #[test]
+    fn omitted_num_clients_is_two() {
+        let settings = parse("").expect("valid settings");
+
+        assert_eq!(settings.num_clients.get(), 2);
+    }
+
+    #[test]
+    fn configured_num_clients_is_kept() {
+        let settings = parse("num_clients = 4").expect("valid settings");
+
+        assert_eq!(settings.num_clients.get(), 4);
+    }
+
+    #[test]
+    fn zero_num_clients_is_rejected() {
+        let error = parse("num_clients = 0").expect_err("zero clients");
+
+        assert!(
+            error.to_string().contains("nonzero"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+mod replicated_store_settings_periodic_client_refresh_secs {
+    use super::*;
+
+    #[test]
+    fn zero_refresh_period_is_rejected() {
+        let error = toml::from_str::<ReplicatedStoreSettings>(
+            &super::replicated_store_settings_num_clients::REQUIRED_KEYS.replace(
+                "periodic_client_refresh_secs = 300",
+                "periodic_client_refresh_secs = 0",
+            ),
+        )
+        .expect_err("zero refresh period");
+
+        assert!(
+            error.to_string().contains("nonzero"),
+            "unexpected error: {error}"
+        );
     }
 }
 

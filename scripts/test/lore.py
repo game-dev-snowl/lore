@@ -13,12 +13,14 @@ import shutil
 import string
 import subprocess
 import sys
+import tempfile
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
 from time import sleep
 from typing import TypedDict, Unpack, overload
 
+from cleanup_util import lore_mount_instance
 from error_types import (
     ServerConnectionError,
     UnknownLoreError,
@@ -51,9 +53,15 @@ from lore_parsers import (
     parse_shared_store_list,
     parse_status_json,
 )
-from service_util import name_service_executable
+from service_util import LORE_TEST_VFS_VAR, name_service_executable
 
 logger = logging.getLogger(__name__)
+
+
+def run_vfs(vfs: str | None) -> str | None:
+    """`vfs`, or the VFS `LORE_TEST_VFS` names for the run where the test names
+    none."""
+    return vfs or os.environ.get(LORE_TEST_VFS_VAR) or None
 
 
 def lore_test_env(global_dir: str) -> dict[str, str]:
@@ -252,7 +260,15 @@ class Lore:
         return ".lore"
 
     def dot_path(self) -> str:
-        """Return the full path to the repository metadata directory."""
+        """Return the full path to the repository metadata directory.
+
+        A virtual clone keeps it outside its mount, in the external directory the
+        global data directory holds for its instance, which is where Lore finds it
+        through the mount table."""
+        instance = lore_mount_instance(self.path)
+        if instance is not None:
+            global_dir = self.sandboxed_env()["LORE_GLOBAL_PATH"]
+            return os.path.join(global_dir, "data", "external", instance, ".lore")
         return os.path.join(self.path, self.dot_dir())
 
     def ignore_file(self) -> str:
@@ -454,6 +470,20 @@ class Lore:
     def repository_list(self, url: str | None = None, **kwargs: Unpack[GlobalOptions]):
         return self.run(["repository", "list"] + ([url] if url else []), **kwargs)
 
+    def _own_shared_store(
+        self, asked_vfs: str | None, vfs: str | None, repo_path: str
+    ) -> str | None:
+        """A shared store of its own, beside `repo_path`, for a repository that
+        `LORE_TEST_VFS` makes virtual where the test asked for no shared store, or
+        `None` for any other. A virtual clone always uses a shared store, and one
+        of its own keeps the repository apart from the test's others, as the store
+        in its own `.lore` did: a branch it commits to doesn't advance in theirs."""
+        if asked_vfs or vfs in (None, "none"):
+            return None
+        store = f"{repo_path}.store"
+        self.created_paths.append(store)
+        return store
+
     def repository_create(
         self,
         remote_path: str | None = None,
@@ -464,6 +494,10 @@ class Lore:
         shared_store_path: str | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
+        asked_vfs = vfs
+        vfs = run_vfs(vfs)
+        if not (use_shared_store or shared_store_path):
+            shared_store_path = self._own_shared_store(asked_vfs, vfs, self.path)
         output = self.run(
             ["repository", "create", remote_path if remote_path else self.remote_path]
             + (["--description", description] if description else [])
@@ -575,6 +609,36 @@ class Lore:
             ["repository", "instance", "move", target_path]
             + (["--dry-run"] if dry_run else []),
             **kwargs,
+        )
+
+    def repository_instance_clone(
+        self,
+        destination: str,
+        dry_run: bool = False,
+        allow_copy: bool = False,
+        **kwargs: Unpack[GlobalOptions],
+    ) -> "Lore":
+        """Clone this instance to `destination`, which a relative path names against the `cwd` the
+        command runs in, and return the clone."""
+        resolved = os.path.join(kwargs.get("cwd") or self.path, str(destination))
+        # Recorded before the clone exists, so a clone that fails partway is removed with the test.
+        self.created_paths.append(resolved)
+        self.run(
+            ["repository", "instance", "clone", str(destination)]
+            + (["--dry-run"] if dry_run else [])
+            + (["--allow-copy"] if allow_copy else []),
+            **kwargs,
+        )
+        return Lore(
+            base_env=self.base_env,
+            remote_path=self.remote_path,
+            remote_url=self.remote,
+            lore_executable_path=self.lore_executable_path,
+            path=resolved,
+            name=os.path.basename(resolved),
+            create_repo=False,
+            created_paths=self.created_paths,
+            environment_vars=self.environment_vars,
         )
 
     def repository_store(self, **kwargs: Unpack[GlobalOptions]):
@@ -1952,6 +2016,24 @@ class Lore:
             str(keep_store_alive_seconds),
         )
 
+    def file_metadata_set_capi(
+        self, library_path: str, paths: list[str], key: str, value: str
+    ) -> int:
+        """Set `key` to `value` on every path in one call through the public C API,
+        returning the FFI code. The CLI sets metadata on one path per call."""
+        # The value goes through a file, as a Windows command line holds at most 32 KiB.
+        with tempfile.TemporaryDirectory() as directory:
+            value_file = Path(directory) / "value"
+            value_file.write_text(value)
+            return self._capi_driver(
+                library_path,
+                "file-metadata-set",
+                self.path,
+                key,
+                str(value_file),
+                *(self._fix_path(path) for path in paths),
+            )
+
     def layer_add(
         self,
         target_path: str,
@@ -2125,6 +2207,10 @@ class Lore:
         no_tracking: bool = False,
         **kwargs: Unpack[GlobalOptions],
     ):
+        asked_vfs = vfs
+        # A bare, untracked or dry-run clone has no virtual form, so it stays as asked.
+        if not (bare or no_tracking or kwargs.get("dry_run")):
+            vfs = run_vfs(vfs)
         new_repo_name = name if name else self.generate_random_name()
         if path is None:
             parent = Path(self.path).parent
@@ -2134,6 +2220,10 @@ class Lore:
         # Recorded before the directory exists, so a clone that fails partway
         # through still has its half-written tree removed with the test.
         self.created_paths.append(str(new_repo_path))
+        if not (use_shared_store or shared_store_path):
+            shared_store_path = self._own_shared_store(
+                asked_vfs, vfs, str(new_repo_path)
+            )
         if not kwargs.get("dry_run") and vfs != "swfs":
             new_repo_path.mkdir(exist_ok=True)
         root_file_args = []
@@ -2799,9 +2889,17 @@ class Lore:
     def clear_local_files(self):
         """
         Remove all local repository files for this repository
+
+        A virtual clone's files and `.lore` are the service's, so its instance is
+        deleted, which unmounts it, before the mount point goes. The delete runs
+        from outside the mount, which a working directory inside would hold busy.
         """
         import shutil
 
+        if lore_mount_instance(self.path) is not None:
+            self.repository_instance_delete(
+                cwd=os.path.dirname(os.path.realpath(self.path))
+            )
         shutil.rmtree(self.path, ignore_errors=True)
 
     def make_dirs(self, path):
