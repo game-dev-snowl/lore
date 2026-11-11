@@ -142,6 +142,8 @@ lore repository list lores://192.168.1.29:41337    # must fail with an auth erro
 
 ## Troubleshooting
 
+To trace a failing login or push, run [`scripts/trace-auth.sh`](../scripts/trace-auth.sh) from the root of the working tree, and `./scripts/trace-auth.sh --server` on the server. It decodes the stored token's claims (the token itself isn't saved), checks them against this page, runs the push with `--log-level trace`, and prints the likely causes from the table below. Add `--push` to run the real push instead of a dry run.
+
 | Symptom | Likely cause |
 |---|---|
 | `No authentication configured on server` from `lore login` | The CLI or server is older than 0.11 and can't do OIDC login. Upgrade both ([below](#upgrading-lore)). |
