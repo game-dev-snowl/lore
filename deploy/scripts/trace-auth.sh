@@ -76,28 +76,36 @@ diagnose() {
   exit 1
 }
 
-# Flags stored logins whose `Expires:` time in `lore auth list` has passed. A login past it
-# can no longer be refreshed, so every call that needs a token fails until `lore login`.
-check_auth_list() {
-  run auth-list lore auth list
+# `lore auth list` prints each token's own expiry, which is short and which the CLI refreshes
+# by itself, so it says nothing about whether the login still works. `lore auth info` also
+# prints how long the login can be refreshed; past that, every call fails until `lore login`.
+check_refresh() {
   command -v python3 >/dev/null || return 0
-  local expired
-  expired="$(python3 -I -c '
+  local state
+  state="$(python3 -I -c '
 import sys, time
 from email.utils import parsedate_to_datetime
-n = 0
+def past(v):
+    try:
+        return parsedate_to_datetime(v.strip()).timestamp() < time.time()
+    except (TypeError, ValueError):
+        return False
+expires = until = None
+refreshable = False
 for line in open(sys.argv[1]):
     k, _, v = line.strip().partition(":")
-    if k == "Expires":
-        try:
-            if parsedate_to_datetime(v.strip()).timestamp() < time.time():
-                n += 1
-        except (TypeError, ValueError):
-            pass
-print(n)
-' "$OUT/auth-list.log" 2>/dev/null)"
-  if [ "${expired:-0}" -gt 0 ]; then
-    finding "$expired stored login(s) in 'lore auth list' are past their Expires time, so the CLI can't refresh them and every authenticated call fails. Log in again: lore login ${1:-<lores://server:41337>}"
+    if k == "Expires": expires = v
+    elif k == "Refreshable until": until = v
+    elif line.strip() == "Refreshable": refreshable = True
+if until is not None:
+    print("dead" if past(until) else "ok")
+elif not refreshable and expires is not None and past(expires):
+    print("dead")
+else:
+    print("ok")
+' "$OUT/auth-info.log" 2>/dev/null)"
+  if [ "$state" = dead ]; then
+    finding "The stored login can no longer be refreshed ('lore auth info' shows its refresh time, or its token without a refresh, in the past), so every authenticated call fails. Log in again: lore login $1"
   fi
 }
 
@@ -170,7 +178,7 @@ else
   if [ -z "$REMOTE" ]; then
     finding "No remote_url here ($PWD is not a Lore working tree). cd to the root of the working tree that won't push and run this script by its path. The connection, token and push checks were skipped because they need the repository."
     section "Client: stored identities"
-    check_auth_list
+    run auth-list lore auth list
     diagnose
   fi
   case "$REMOTE" in lore://*)
@@ -201,9 +209,12 @@ else
   fi
 
   section "Client: stored identities"
-  check_auth_list "$SERVER_URL"
-  run auth-info lore auth info \
-    || finding "'lore auth info' failed: no usable stored login. Run: lore login $SERVER_URL"
+  run auth-list lore auth list
+  if run auth-info lore auth info; then
+    check_refresh "$SERVER_URL"
+  else
+    finding "'lore auth info' failed: no usable stored login. Run: lore login $SERVER_URL"
+  fi
 
   section "Client: access token claims (the token itself isn't saved)"
   TOKEN_OUT="$(lore auth info --with-access-token 2>&1)"; TOKEN_RC=$?
