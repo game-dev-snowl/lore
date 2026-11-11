@@ -67,26 +67,27 @@ function Show-Diagnosis {
   if ($Findings.Count -eq 0) { exit 0 } else { exit 1 }
 }
 
-# Flags stored logins whose `Expires:` time in `lore auth list` has passed. A login past it
-# can no longer be refreshed, so every call that needs a token fails until `lore login`.
-function Test-AuthList([string]$ServerUrl) {
-  [void](Run 'auth-list' 'lore' @('auth', 'list'))
-  $expired = 0
-  foreach ($line in Get-Content (Join-Path $Out 'auth-list.log')) {
-    if ($line -match '^\s*Expires:\s*(.+?)\s*$') {
-      # "Sat, 7 Nov 2026 18:38:13 +0000": .NET wants the offset as +00:00.
-      $text = $Matches[1] -replace '([+-]\d\d)(\d\d)$', '$1:$2'
-      $when = [DateTimeOffset]::MinValue
-      if ([DateTimeOffset]::TryParse($text, [Globalization.CultureInfo]::InvariantCulture,
-          [Globalization.DateTimeStyles]::None, [ref]$when) -and $when -lt [DateTimeOffset]::UtcNow) {
-        $expired++
-      }
-    }
+# `lore auth list` prints each token's own expiry, which is short and which the CLI refreshes
+# by itself, so it says nothing about whether the login still works. `lore auth info` also
+# prints how long the login can be refreshed; past that, every call fails until `lore login`.
+function Test-Refresh([string]$ServerUrl) {
+  $expires = $null; $until = $null; $refreshable = $false
+  foreach ($line in Get-Content -LiteralPath (Join-Path $Out 'auth-info.log')) {
+    if ($line -match '^\s*Expires:\s*(.+?)\s*$') { $expires = $Matches[1] }
+    elseif ($line -match '^\s*Refreshable until:\s*(.+?)\s*$') { $until = $Matches[1] }
+    elseif ($line.Trim() -eq 'Refreshable') { $refreshable = $true }
   }
-  if ($expired -gt 0) {
-    $hint = if ($ServerUrl) { $ServerUrl } else { '<lores://server:41337>' }
-    Finding "$expired stored login(s) in 'lore auth list' are past their Expires time, so the CLI can't refresh them and every authenticated call fails. Log in again: lore login $hint"
+  $dead = if ($until) { Test-Past $until } elseif (-not $refreshable -and $expires) { Test-Past $expires } else { $false }
+  if ($dead) {
+    Finding "The stored login can no longer be refreshed ('lore auth info' shows its refresh time, or its token without a refresh, in the past), so every authenticated call fails. Log in again: lore login $ServerUrl"
   }
+}
+
+function Test-Past([string]$Rfc2822) {
+  $when = [DateTimeOffset]::MinValue
+  $ok = [DateTimeOffset]::TryParse(($Rfc2822 -replace '([+-]\d\d)(\d\d)$', '$1:$2'),
+    [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$when)
+  return ($ok -and $when -lt [DateTimeOffset]::UtcNow)
 }
 
 # ---------------------------------------------------------------------------
@@ -136,7 +137,7 @@ Say ("remote_url = " + $(if ($Remote) { $Remote } else { '<none>' }))
 if (-not $Remote) {
   Finding "No remote_url here ($PWD is not a Lore working tree). cd to the root of the working tree that won't push and run this script by its path. The connection, token and push checks were skipped because they need the repository."
   Section 'Client: stored identities'
-  Test-AuthList ''
+  [void](Run 'auth-list' 'lore' @('auth', 'list'))
   Show-Diagnosis
 }
 if ($Remote -like 'lore://*') { Finding 'remote_url uses lore://, which sends tokens without TLS. Use lores:// for this server.' }
@@ -165,8 +166,10 @@ if (-not $tcpOk) {
     return $true
   }
   try {
+    $tcp.ReceiveTimeout = 10000; $tcp.SendTimeout = 10000
     $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, $callback)
-    $ssl.AuthenticateAsClient($TargetHost)
+    # Windows PowerShell 5.1 offers only SSL3 and TLS 1.0 by default; the server needs 1.2+.
+    $ssl.AuthenticateAsClient($TargetHost, $null, [Security.Authentication.SslProtocols]::Tls12, $false)
     Say "    subject: $($chainInfo.Subject)"
     Say "    issuer:  $($chainInfo.Issuer)"
     Say "    Windows chain check: $($chainInfo.Errors) $($chainInfo.Detail)"
@@ -178,14 +181,16 @@ if (-not $tcpOk) {
     }
     $ssl.Dispose()
   } catch {
-    Say "    TLS handshake failed: $($_.Exception.InnerException.Message) $($_.Exception.Message)"
+    Finding "TLS handshake with ${TargetHost}:$Port failed: $($_.Exception.InnerException.Message) $($_.Exception.Message)"
   } finally { $tcp.Dispose() }
 }
 
 Section 'Client: stored identities'
-Test-AuthList $ServerUrl
+[void](Run 'auth-list' 'lore' @('auth', 'list'))
 if ((Run 'auth-info' 'lore' @('auth', 'info')) -ne 0) {
   Finding "'lore auth info' failed: no usable stored login. Run: lore login $ServerUrl"
+} else {
+  Test-Refresh $ServerUrl
 }
 
 Section "Client: access token claims (the token itself isn't saved)"
