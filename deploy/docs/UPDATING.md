@@ -34,14 +34,14 @@ fetch origin/main ─▶ show plan  ─▶ fast-forward clone ─▶ docker comp
 |---|---|---|
 | `scripts/*`, `docs/*`, `auth0/*`, anything outside `deploy/` | none | none |
 | `config/local.toml`, `certs/*` | `docker compose restart` | ~5–10 s |
-| `docker-compose.yml` | `docker compose up -d` (recreate) | ~5–10 s |
+| `docker-compose.yml` | `docker compose up -d --force-recreate` | ~5–10 s |
 | image (`--version`, or a different image in the files) | pull, backup, recreate | ~1 min backup + ~10 s |
 
 Safety rails:
 
 - It refuses to run while a tracked file is edited on the server, while another deploy or a backup runs (they share a lock, `/run/lock/lore-deploy.lock`), or when `origin/main` doesn't contain the deployed commit.
 - It waits until Docker reports the container healthy, and gives up early if the server is crash-looping (a bad `local.toml` fails in about 10 s).
-- On failure it rolls back on its own. A failure before the server is touched (a fetch, a pull, a Compose file that doesn't resolve) only puts the files back; the server keeps running. A failure after it starts a fresh container from the previous commit and the last healthy `.env`.
+- On failure it rolls back on its own. A failure before the server is touched (a merge, a pull, a Compose file that doesn't resolve) only puts the files back; the server keeps running. A fetch that fails stops the run before anything changes. A failure after it starts a fresh container from the previous commit and the last healthy `.env`.
 - A commit whose Compose file doesn't resolve, or whose server doesn't come up, goes into `.deploy/failed`, so an unattended run won't try it again until a newer commit lands, or you pass `--force`. A network or registry error doesn't: the next run tries again.
 - It never changes the stores. If a new image changed the store format, going back to the old image needs the backup restored ([Rolling back](#rolling-back)).
 
@@ -130,21 +130,23 @@ To go back to the healthy state before the last deploy that restarted or recreat
 ./scripts/deploy.sh --rollback
 ```
 
-It restores that state's commit and `.env` and starts a fresh container from them. Deploys that touch only scripts or docs don't move this point, so `--rollback` after an upgrade and a later docs-only deploy still returns to the old version. It goes back one step: it doesn't keep a history of states.
+It restores that state's commit and `.env` and starts a fresh container from them. Deploys that touch only scripts or docs don't move this point, so `--rollback` after an upgrade and a later docs-only deploy still returns to the old version. After a failed deploy left in place with `--no-rollback`, it returns to the healthy state that deploy replaced instead. It goes back one step: it doesn't keep a history of states.
 
-If the deploy you're undoing changed the image, and the new version changed the store format, the old image may not read the stores any more. The script says so when the image changes. Restore the backup the deploy took (`ls -t /srv/lore/backups | head -1`), with the timer stopped, so no deploy starts the server on a half-restored store:
+If the deploy you're undoing changed the image, and the new version changed the store format, the old image may not read the stores any more. The script says so whenever a rollback changes the image, and names the backup taken before the upgrade. Use that archive, not the newest one: a nightly backup taken after the upgrade holds the new format. `history.log` names it too (`backup=` on the upgrade's line), and `backup.sh` keeps only the newest 14 archives, so copy it aside if the rollback can wait.
+
+Restore it with the timer stopped, so no deploy starts the server on a half-restored store. With `LORE_DATA_DIR` from `.env`:
 
 ```bash
 sudo systemctl stop lore-deploy.timer          # if you set it up
 docker compose stop loreserver
-sudo sh -c 'rm -rf /srv/lore/data/* && tar -C /srv/lore/data --zstd -xf /srv/lore/backups/lore-data-<stamp>.tar.zst'
+sudo sh -c 'find /srv/lore/data -mindepth 1 -delete && tar -C /srv/lore/data --zstd -xf /srv/lore/backups/lore-data-<stamp>.tar.zst'
 docker compose start loreserver
 sudo systemctl start lore-deploy.timer
 ```
 
 This loses every push made since the backup.
 
-To undo a change for good, revert the commit on `main` and deploy. A rollback alone leaves `main` ahead of the server, and the next deploy brings the change back, unless the commit is in `.deploy/failed`.
+To undo a change for good, revert the commit on `main` and deploy. `--rollback` marks the commit it leaves as failed, so the timer won't deploy it again, but any newer commit on `main` brings the change back with it.
 
 ### Reference
 
@@ -180,11 +182,12 @@ State lives in `/opt/lore/deploy/.deploy/` (ignored by git):
 |---|---|
 | `history.log` | one line per deploy, failure and rollback |
 | `failed` | commits not to deploy again without `--force` |
-| `good`, `good.env` | the running healthy state: commit, image, `.env` |
+| `good`, `good.env` | the running healthy state: commit, image, the backup taken before it, `.env` |
 | `prev`, `prev.env` | the healthy state before it, which `--rollback` restores |
+| `pending` | a failed deploy left in place with `--no-rollback`; `--rollback` then restores `good` |
 | `failed.env` | the `.env` a failed deploy tried, when it differs from the restored one |
 
-`tests/test-deploy.sh` tests the script with a stub `docker`; run it after changing `deploy.sh` or `backup.sh`.
+`tests/test-deploy.sh` tests both scripts with stub `docker`, `sudo` and `runuser` commands; run it after changing `deploy.sh` or `backup.sh`.
 
 ## Part 3: automating it
 
@@ -254,7 +257,7 @@ The timer sees the image change, pulls it, takes the backup, and starts it, roll
 
 ### Being told when a deploy fails
 
-`journalctl -u lore-deploy.service` has every run. To get a message when one fails, add an `OnFailure=` unit to the service that sends mail or calls a webhook, for example:
+`journalctl -u lore-deploy.service` has every run. A failed fetch exits 2, so a GitHub or network outage alerts too. To get a message when one fails, add an `OnFailure=` unit to the service that sends mail or calls a webhook, for example:
 
 ```ini
 # in [Unit] of lore-deploy.service
@@ -275,6 +278,7 @@ ExecStart=/usr/bin/curl -fsS -d "lore deploy failed on %H: journalctl -u lore-de
 | `tracked files were changed on the server` | Someone edited a file on the server. `git diff` shows it. Move the change into the repository, then `git checkout -- <file>`. |
 | `<commit> failed to deploy before` (exit 3) | The last deploy of that commit failed and was rolled back. Fix it on `main`; the next commit deploys. To retry the same commit: `--force`. |
 | `another deploy or a backup is running` (exit 4) | The timer or a backup is mid-run. Wait, or check `pgrep -af 'deploy.sh\|backup.sh'`. The lock is released when the process exits, even if it was killed. |
+| `run this as <user>, who owns …` | The script runs git as the clone's owner. Run it as that user, or with `sudo`. |
 | `isn't a git clone` | The server still runs the rsync copy. [GIT-DEPLOY.md, part B](GIT-DEPLOY.md#b-replace-an-existing-rsync-copy). |
 | `the clone is on 'X', not 'main'` | `git -C /opt/lore switch main`, or pass `--branch X`. |
 | `crash-looping` or `unhealthy` after a deploy | The output shows the server's last log lines; the deploy was rolled back. Usually a config key the new version doesn't accept, or a TOML error. Run with `--no-rollback` to keep it running while you look: `docker compose logs loreserver`. |

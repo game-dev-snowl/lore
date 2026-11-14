@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stub runuser for tests/test-deploy.sh: drops "-u USER --" and runs the rest
+# as the caller.
+[ "$1" = -u ] && shift 2
+[ "$1" = -- ] && shift
+exec "$@"

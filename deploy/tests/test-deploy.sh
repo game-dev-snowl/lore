@@ -4,9 +4,14 @@
 #   ./tests/test-deploy.sh
 #
 # Each case builds an origin repository holding a copy of deploy/, clones it,
-# and runs deploy.sh in the clone with tests/stub-docker first on PATH. The stub
-# keeps the container's state in files and logs each call, so a case asserts
-# which compose commands ran. Needs git, bash, flock, tar and zstd; no Docker.
+# and runs deploy.sh in the clone with tests/stubs first on PATH. The docker
+# stub keeps the container's state in files and logs each call, so a case
+# asserts which compose commands ran; the sudo and runuser stubs run their
+# command as the caller, so the suite runs as any user. Needs git, bash,
+# flock, tar and zstd; no Docker.
+#
+# Not covered: real Docker and Compose (restart and health semantics), and
+# file ownership after a root run; check those by hand on a test host.
 # shellcheck disable=SC2016,SC2034 # checks are strings run by eval, which reads these
 set -euo pipefail
 
@@ -59,7 +64,7 @@ push() {
 }
 deploy() { # args...; sets rc, output in $out
   rc=0
-  (cd "$D" && PATH="$HERE/stub-docker:$PATH" ./scripts/deploy.sh "$@") </dev/null >"$out" 2>&1 || rc=$?
+  (cd "$D" && PATH="$HERE/stubs:$PATH" ./scripts/deploy.sh "$@") </dev/null >"$out" 2>&1 || rc=$?
 }
 # The calls that act on the container, without the read-only ones.
 calls() { grep -v -E '^inspect|^compose( -f [^ ]+| --project-directory [^ ]+)* (version|config|logs|ps)' "$STUB_DIR/calls" 2>/dev/null | tr '\n' ';' || true; }
@@ -98,7 +103,7 @@ check "renamed config file: restart" '[ $rc -eq 0 ] && [ "$(calls)" = "compose r
 setup
 push compose sed -i 's/max-file: "5"/max-file: "6"/' docker-compose.yml
 deploy
-check "compose change: recreate" '[ $rc -eq 0 ] && [ "$(calls)" = "compose up -d loreserver;" ]'
+check "compose change: recreate" '[ $rc -eq 0 ] && [ "$(calls)" = "compose up -d --force-recreate loreserver;" ]'
 
 setup
 push crash bash -c 'echo "# STUB_CRASH" >> config/local.toml'
@@ -125,7 +130,7 @@ setup
 deploy --version 0.14.0 --check
 check "--version --check names the new image and the backup" '[ $rc -eq 0 ] && grep -q "pull ghcr.io/epicgames/lore/loreserver:0.14.0, back up" "$out" && [ -z "$(calls)" ]'
 deploy --version 0.14.0
-check "--version: pull, backup, recreate" '[ $rc -eq 0 ] && [ "$(calls)" = "compose pull --quiet loreserver;compose stop loreserver;compose start loreserver;compose up -d loreserver;" ] && ls "$C/backups"/lore-data-*.tar.zst >/dev/null'
+check "--version: pull, backup, recreate" '[ $rc -eq 0 ] && [ "$(calls)" = "compose pull --quiet loreserver;compose stop loreserver;compose start loreserver;compose up -d --force-recreate loreserver;" ] && ls "$C/backups"/lore-data-*.tar.zst >/dev/null'
 check "  ... .env holds the new version" 'grep -qx LORE_VERSION=0.14.0 "$D/.env"'
 push docs bash -c 'echo more >> docs/UPDATING.md'
 deploy
@@ -167,6 +172,56 @@ mv "$D/.env" "$D/env.saved"
 deploy
 check "no .env: exit 2" '[ $rc -eq 2 ]'
 
+setup
+push compose-comment bash -c 'sed -i "1s/^/# a comment\n/" docker-compose.yml'
+deploy
+check "comment-only compose change: recreated and healthy" '[ $rc -eq 0 ] && [ "$(calls)" = "compose up -d --force-recreate loreserver;" ]'
+
+setup
+push config sed -i 's/flush_delay_seconds = 10/flush_delay_seconds = 5/' config/local.toml
+deploy
+good_rev="$(rev)"
+push crash bash -c 'echo "# STUB_CRASH" >> config/local.toml'
+deploy --no-rollback
+check "--no-rollback leaves the failure in place" '[ $rc -eq 1 ] && grep -q STUB_CRASH "$D/config/local.toml"'
+deploy --rollback
+check "  ... then --rollback returns to the state it replaced" '[ $rc -eq 0 ] && [ "$(rev)" = "$good_rev" ] && [ ! -f "$D/.deploy/pending" ]'
+
+setup
+sed -i 's/^LORE_VERSION=.*/LORE_VERSION=0.14.0/' "$D/.env"
+deploy
+check "hand-edited LORE_VERSION (drift): pull, backup, recreate" '[ $rc -eq 0 ] && [ "$(cat "$STUB_DIR/image")" = ghcr.io/epicgames/lore/loreserver:0.14.0 ] && ls "$C/backups"/lore-data-*.tar.zst >/dev/null'
+
+setup
+deploy --force
+check "--force alone: recreates" '[ $rc -eq 0 ] && [ "$(calls)" = "compose up -d --force-recreate loreserver;" ]'
+
+setup
+mkdir -p "$C/badtar"
+printf '#!/bin/sh\nexit 1\n' > "$C/badtar/tar"; chmod +x "$C/badtar/tar"
+rc=0; (cd "$D" && PATH="$C/badtar:$HERE/stubs:$PATH" ./scripts/deploy.sh --version 0.14.0) </dev/null >"$out" 2>&1 || rc=$?
+check "backup fails during an upgrade: exit 1, old image back, nothing remembered" '[ $rc -eq 1 ] && grep -qx LORE_VERSION=0.13.0 "$D/.env" && [ "$(cat "$STUB_DIR/image")" = ghcr.io/epicgames/lore/loreserver:0.13.0 ] && [ ! -s "$D/.deploy/failed" ]'
+
+setup
+deploy --version 0.14.0-crash
+check "upgrade whose server won't start: back to 0.13.0, names the backup" '[ $rc -eq 1 ] && [ "$(cat "$STUB_DIR/image")" = ghcr.io/epicgames/lore/loreserver:0.13.0 ] && grep -q "store format" "$out" && grep -q "That backup is $C/backups/lore-data-" "$out"'
+
+setup
+push config sed -i 's/flush_delay_seconds = 10/flush_delay_seconds = 5/' config/local.toml
+deploy
+echo "RUST_LOG=bogus" >> "$D/.env"
+push docs bash -c 'echo more >> docs/UPDATING.md'
+deploy
+push crash bash -c 'echo "# STUB_CRASH" >> config/local.toml'
+deploy
+check "hand edit to .env, docs deploy, failure: restores the .env from before the edit" '[ $rc -eq 1 ] && ! grep -q RUST_LOG=bogus "$D/.env"'
+
+setup
+push crash bash -c 'echo "# STUB_CRASH" >> config/local.toml'
+deploy
+deploy --check
+check "--check on a commit that failed before: shows the plan, exit 0" '[ $rc -eq 0 ] && grep -q "needs --force" "$out" && grep -q "action:" "$out"'
+
 echo "backup.sh"
 
 setup
@@ -178,12 +233,12 @@ while [ $# -gt 0 ]; do [ "$1" = -cf ] && { echo partial > "$2"; }; shift; done
 exit 1
 EOF
 chmod +x "$C/badtar/tar"
-rc=0; (cd "$D" && PATH="$C/badtar:$HERE/stub-docker:$PATH" ./scripts/backup.sh "$C/backups") >"$out" 2>&1 || rc=$?
+rc=0; (cd "$D" && PATH="$C/badtar:$HERE/stubs:$PATH" ./scripts/backup.sh "$C/backups") >"$out" 2>&1 || rc=$?
 check "failed tar: exit non-zero, no archive left, server started again" '[ $rc -ne 0 ] && [ -z "$(ls "$C/backups")" ] && tail -n1 "$STUB_DIR/calls" | grep -q "compose start"'
 
 setup
 echo stale > "$C/backups/lore-data-20000101T000000Z.tar.zst.partial"
-rc=0; (cd "$D" && PATH="$HERE/stub-docker:$PATH" ./scripts/backup.sh "$C/backups") >"$out" 2>&1 || rc=$?
+rc=0; (cd "$D" && PATH="$HERE/stubs:$PATH" ./scripts/backup.sh "$C/backups") >"$out" 2>&1 || rc=$?
 check "a run removes partials a killed run left" '[ $rc -eq 0 ] && ! ls "$C/backups"/*.partial >/dev/null 2>&1 && ls "$C/backups"/lore-data-*.tar.zst >/dev/null'
 
 echo

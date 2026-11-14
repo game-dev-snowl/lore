@@ -2,8 +2,11 @@
 # Stub docker for tests/test-deploy.sh: the commands deploy.sh and backup.sh
 # run, with the container's state in files under $STUB_DIR, and each call
 # appended to $STUB_DIR/calls. A config/local.toml holding STUB_CRASH makes the
-# server crash-loop; a compose file holding STUB_BROKEN doesn't resolve; an
-# image tag holding "missing" can't be pulled.
+# server crash-loop, as does an image tag holding "crash"; a compose file
+# holding STUB_BROKEN doesn't resolve; an image tag holding "missing" can't be
+# pulled. Like Compose, `up -d` without --force-recreate keeps the container
+# when the service definition (the compose file without comments) and the
+# image are unchanged.
 set -euo pipefail
 S="${STUB_DIR:?}"
 echo "$*" >> "$S/calls"
@@ -17,11 +20,18 @@ image_of() { # compose-file project-dir
   ver="${LORE_VERSION:-$(sed -n 's/^LORE_VERSION=//p' "$2/.env" 2>/dev/null | tail -n1)}"
   printf '%s\n' "$line" | sed "s/\${LORE_VERSION:-[^}]*}/${ver:-$default}/"
 }
+definition() { # compose-file image
+  { grep -v '^ *#' "$1" | sed 's/ #.*//'; echo "$2"; } | cksum
+}
 start() { # image
   echo "$1" > "$S/image"
   echo $(( $(cat "$S/started") + 1 )) > "$S/started"
   echo 0 > "$S/restarts"
-  if grep -q STUB_CRASH config/local.toml; then echo crash > "$S/health"; else echo healthy > "$S/health"; fi
+  if grep -q STUB_CRASH config/local.toml || case "$1" in *crash*) true ;; *) false ;; esac; then
+    echo crash > "$S/health"
+  else
+    echo healthy > "$S/health"
+  fi
 }
 
 case "$1" in
@@ -55,7 +65,16 @@ case "$1" in
         ;;
       pull)
         case "$(image_of "$file" "$dir")" in *missing*) echo "not found" >&2; exit 1 ;; esac ;;
-      up|restart|start) start "$(image_of "$file" "$dir")" ;;
+      up)
+        img="$(image_of "$file" "$dir")"
+        if [[ " $* " != *" --force-recreate "* ]] && [ -f "$S/definition" ] &&
+           [ "$(definition "$file" "$img")" = "$(cat "$S/definition")" ]; then
+          exit 0
+        fi
+        start "$img"
+        definition "$file" "$img" > "$S/definition"
+        ;;
+      restart|start) start "$(cat "$S/image")" ;;
       stop|logs|ps) ;;
     esac
     ;;
