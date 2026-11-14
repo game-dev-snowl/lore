@@ -209,12 +209,11 @@ Change files in the repository, from your machine or on GitHub, and merge to `ma
 
 ```bash
 cd /opt/lore/deploy
-git pull --ff-only
-docker compose up -d                  # after a docker-compose.yml or .env change
-docker compose restart loreserver     # after a config/local.toml change only
+./scripts/deploy.sh                       # pull, restart what changed, check health, roll back on failure
+./scripts/deploy.sh --version <version>   # upgrade the Lore image: backup first, then the new image
 ```
 
-Upgrading the Lore image is still a `.env` change: bump `LORE_VERSION`, then `docker compose pull && docker compose up -d` ([DEPLOYMENT.md](DEPLOYMENT.md) §5). Take a backup first.
+[UPDATING.md](UPDATING.md) describes both, rolling back, and running deploys on a timer.
 
 ## Troubleshooting
 

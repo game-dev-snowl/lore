@@ -119,6 +119,8 @@ Always give the port explicitly. Without it, `lores://` defaults gRPC to **443**
 
 ### Upgrade the server
 
+From a git clone ([GIT-DEPLOY.md](GIT-DEPLOY.md)), use `./scripts/deploy.sh --version <version>`, which takes the backup and rolls back on its own: [UPDATING.md](UPDATING.md). From an rsync copy:
+
 ```bash
 # copy any changes from your machine first (section 0), then on the server:
 cd /opt/lore

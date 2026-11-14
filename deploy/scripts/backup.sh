@@ -24,7 +24,10 @@ echo "[$stamp] stopping loreserver"
 docker compose stop loreserver
 trap 'docker compose start loreserver' EXIT
 
-tar -C "$DATA_DIR" --zstd -cf "$out" .
+# Written under another name and renamed when complete, so a failed run
+# leaves no archive that looks whole and isn't.
+tar -C "$DATA_DIR" --zstd -cf "$out.partial" . || { rm -f "$out.partial"; exit 1; }
+mv "$out.partial" "$out"
 echo "wrote $out ($(du -h "$out" | cut -f1))"
 
 ls -1t "$BACKUP_DIR"/lore-data-*.tar.zst | tail -n +"$((KEEP + 1))" | xargs -r rm -f

@@ -18,11 +18,13 @@ Docker Compose deployment of [Lore](https://lore.org) (Epic Games' open-source V
 │   ├── setup-server.sh         # fresh Ubuntu/Debian host → Docker, certbot, UFW, sysctl
 │   ├── issue-cert.sh           # Let's Encrypt cert + renewal hook
 │   ├── certbot-deploy-hook.sh  # copies renewed cert, restarts loreserver
+│   ├── deploy.sh               # update from origin/main: backup, restart, health check, rollback
 │   └── backup.sh               # cold backup of the stores
 └── docs/
     ├── LINUX-SETUP.md          # provisioning + hardening the host
     ├── DEPLOYMENT.md           # deploy, connect clients, upgrade, backup, troubleshoot
     ├── GIT-DEPLOY.md           # run from a git clone at /opt/lore (update = git pull)
+    ├── UPDATING.md             # roll out changes and image upgrades with deploy.sh, automate it
     └── AUTH0.md                # Auth0 sign-in + role-based permissions
 ```
 
@@ -34,6 +36,8 @@ Docker Compose deployment of [Lore](https://lore.org) (Epic Games' open-source V
 | **Public** (VPS / datacenter) | Let's Encrypt (`scripts/issue-cert.sh`) | [docs/LINUX-SETUP.md](docs/LINUX-SETUP.md) → [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
 
 > [!TIP]
+> To roll out changes, upgrade the Lore image, roll back, or deploy on a timer, use `scripts/deploy.sh`: [docs/UPDATING.md](docs/UPDATING.md).
+>
 > To run the server from a git clone of this repository instead of an rsync copy, and update it with `git pull`, follow [docs/GIT-DEPLOY.md](docs/GIT-DEPLOY.md). It also covers replacing an existing `/opt/lore` copy.
 
 ## Quick start: public mode

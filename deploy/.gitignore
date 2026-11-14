@@ -11,3 +11,4 @@ backups/
 .idea/
 .vscode/
 *.swp
+.deploy/
