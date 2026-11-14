@@ -15,7 +15,21 @@ DATA_DIR="${LORE_DATA_DIR:?}"
 BACKUP_DIR="${1:-/srv/lore/backups}"
 KEEP="${KEEP:-14}"
 
+# A deploy (scripts/deploy.sh) restarts the server, so the two never overlap:
+# wait for a running deploy. deploy.sh sets LORE_DEPLOY_LOCK_HELD when it runs
+# this script itself, holding the lock already.
+if [ -z "${LORE_DEPLOY_LOCK_HELD:-}" ]; then
+  lock="${LORE_LOCK_FILE:-/run/lock/lore-deploy.lock}"
+  [ -d "$(dirname "$lock")" ] || lock="$LORE_DIR/.deploy/lock"
+  mkdir -p "$(dirname "$lock")"
+  [ -e "$lock" ] || { touch "$lock" && chmod 0644 "$lock"; }
+  exec 9<"$lock"
+  flock -w 3600 9 || { echo "a deploy has held $lock for an hour; no backup taken" >&2; exit 1; }
+fi
+
 mkdir -p "$BACKUP_DIR"
+# Left by a run that was killed before it finished.
+rm -f "$BACKUP_DIR"/lore-data-*.tar.zst.partial
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 out="$BACKUP_DIR/lore-data-$stamp.tar.zst"
 

@@ -1,29 +1,33 @@
 #!/usr/bin/env bash
 # Update the Lore Server from the git clone it runs from (docs/GIT-DEPLOY.md),
 # and roll back on its own if the server doesn't come back healthy.
+# docs/UPDATING.md is the guide.
 #
 #   ./scripts/deploy.sh                    # deploy what's new on origin/main
 #   ./scripts/deploy.sh --version 0.14.0   # also move .env to a new image
 #   ./scripts/deploy.sh --check            # show what would change, change nothing
-#   ./scripts/deploy.sh --rollback         # go back to the last state before a deploy
+#   ./scripts/deploy.sh --rollback         # back to the state before the last deploy
 #
 # Run it as the user who owns the clone, or as root (a systemd timer): as root
 # it runs git as that owner, so the clone never becomes root-owned.
 #
 # What it does, in order:
-#   1. fetch origin, and list the commits and files under deploy/ that are new
+#   1. fetch origin, and print the commits and files under deploy/ that are
+#      new and what the deploy will do with them
 #   2. fast-forward the clone, and set LORE_VERSION in .env if --version is given
 #   3. check the Compose file resolves (`docker compose config`)
 #   4. if the image changes: pull it while the old server runs, then take a
 #      cold backup (scripts/backup.sh) before the new image starts
-#   5. recreate the container (compose or .env change, new image) or restart it
-#      (config/local.toml or certs change); scripts and docs need neither
+#   5. recreate the container (compose file or image change) or restart it
+#      (config/ or certs/ change); scripts and docs need neither
 #   6. wait until Docker reports the container healthy
-#   7. on any failure after step 2: put the files back, start the old server
-#      again, and remember the commit so an unattended run doesn't retry it
+#   7. on a failure in 2-6: put the files back, and if the server was touched,
+#      start it again from the last healthy state. A commit whose Compose file
+#      doesn't resolve, or whose server doesn't come up, is remembered so an
+#      unattended run doesn't retry it.
 #
-# It never touches the stores. If a new image changed the store format, going
-# back to the old image needs the backup restored; the script prints how.
+# It never changes the stores. If a new image changed the store format, going
+# back to the old image needs the backup restored: docs/UPDATING.md, Rolling back.
 #
 # Options:
 #   -c, --check          print the plan and exit; nothing changes
@@ -34,15 +38,21 @@
 #                        a hand edit to .env), or retry a commit that failed
 #       --no-backup      skip the backup before an image change
 #       --no-rollback    leave a failed deploy in place, for debugging
-#       --rollback       restore the commit and .env from before the last deploy
+#       --rollback       return to the healthy state before the last deploy
+#                        that restarted the server
 #   -h, --help           this text
 #
 # Environment: DEPLOY_BRANCH, HEALTH_TIMEOUT (seconds, default 180),
-# BACKUP_DIR (passed to backup.sh, default /srv/lore/backups).
+# BACKUP_DIR (passed to backup.sh, default /srv/lore/backups), LORE_LOCK_FILE
+# (default /run/lock/lore-deploy.lock; tests point it elsewhere).
 #
-# Exit codes: 0 deployed or nothing to do, 1 failed and rolled back (or the
-# rollback itself failed: read the output), 2 bad usage or preflight failure,
-# 3 the target commit failed before and --force wasn't given.
+# Exit codes:
+#   0  deployed, or nothing to do
+#   1  the deploy failed; the files are back as they were, and the server too
+#      if it was touched (the output says if that rollback failed as well)
+#   2  refused or failed before changing anything
+#   3  the target commit failed before; push a fix, or pass --force
+#   4  another deploy or a backup holds the lock
 set -euo pipefail
 # The braces make bash read the whole script before running it: the deploy
 # replaces this file with git, and bash otherwise reads a script as it goes.
@@ -50,6 +60,9 @@ set -euo pipefail
 
 LORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE_DIR="$LORE_DIR/.deploy"
+# Shared with scripts/backup.sh, so a deploy and a backup never overlap.
+LOCK_FILE="${LORE_LOCK_FILE:-/run/lock/lore-deploy.lock}"
+[ -d "$(dirname "$LOCK_FILE")" ] || LOCK_FILE="$STATE_DIR/lock"
 CONTAINER=loreserver
 SERVICE=loreserver
 
@@ -95,8 +108,10 @@ docker compose version >/dev/null 2>&1 || die "the docker compose plugin isn't i
 
 owner="$(stat -c %U "$LORE_DIR")"
 owner_home="$(getent passwd "$owner" | cut -d: -f6)"
+is_root=0
+[ "$(id -u)" -eq 0 ] && is_root=1
 git_() {
-  if [ "$(id -u)" -eq 0 ] && [ "$owner" != root ]; then
+  if [ "$is_root" -eq 1 ] && [ "$owner" != root ]; then
     runuser -u "$owner" -- env HOME="$owner_home" git -C "$LORE_DIR" "$@"
   else
     git -C "$LORE_DIR" "$@"
@@ -105,19 +120,30 @@ git_() {
 
 git_ rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   die "$LORE_DIR isn't a git clone. Move to the clone first: docs/GIT-DEPLOY.md, part B"
+
 mkdir -p "$STATE_DIR"
-# As root, create the state files owned by the clone's owner, so a later run
-# as that user can still write them (writes to an existing file keep its owner).
-if [ "$(id -u)" -eq 0 ]; then
-  touch "$STATE_DIR"/{lock,history.log,failed}
-  chown -R "$owner": "$STATE_DIR"
-fi
-exec 9>"$STATE_DIR/lock"
-flock -n 9 || die "another deploy is running (lock: $STATE_DIR/lock)"
+# phase: plan (nothing changed yet), apply, finished. The EXIT handler maps an
+# unexpected failure in the plan phase to exit 2, and keeps the state files
+# owned by the clone's owner after a root run.
+phase=plan
+# shellcheck disable=SC2329 # run by the EXIT trap
+on_exit() {
+  local rc=$?
+  if [ "$is_root" -eq 1 ]; then chown -R "$owner": "$STATE_DIR" 2>/dev/null || true; fi
+  if [ "$phase" = plan ] && { [ "$rc" -eq 1 ] || [ "$rc" -gt 4 ]; }; then rc=2; fi
+  exit "$rc"
+}
+trap on_exit EXIT
+
+# Opened read-only: flock needs no write access, so a lock file root created
+# serves the owner too, and the reverse.
+[ -e "$LOCK_FILE" ] || { touch "$LOCK_FILE" && chmod 0644 "$LOCK_FILE"; } 2>/dev/null || true
+exec 9<"$LOCK_FILE"
+flock -n 9 || die "another deploy or a backup is running (lock: $LOCK_FILE)" 4
 
 record() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$STATE_DIR/history.log"; }
 
-env_version() { sed -n 's/^LORE_VERSION=//p' .env | tail -n1; }
+env_version() { sed -n 's/^LORE_VERSION=//p' .env | tail -n1 | tr -d "\"'"; }
 set_env_version() {
   if grep -q '^LORE_VERSION=' .env; then
     # Rewrite in place rather than sed -i, which would make a root run's .env root-owned.
@@ -127,18 +153,19 @@ set_env_version() {
     printf '\nLORE_VERSION=%s\n' "$1" >> .env
   fi
 }
-config_image() { docker compose config --images 2>/dev/null | head -n1; }
+config_image() { docker compose config --images 2>/dev/null | head -n1 || true; }
 running_image() { docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true; }
+started_at() { docker inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null || echo none; }
 
-# Healthy, and started after $1 (an RFC 3339 UTC time), so a status left over
-# from the container we replaced doesn't count.
+# Healthy, in a container started after $1 (its StartedAt before the action),
+# so the status of the container we replaced doesn't count.
 wait_healthy() {
-  local since="$1" deadline=$((SECONDS + health_timeout)) status started restarts base
+  local before="$1" deadline=$((SECONDS + health_timeout)) status started restarts base
   base="$(docker inspect -f '{{.RestartCount}}' "$CONTAINER" 2>/dev/null || echo 0)"
   log "waiting up to ${health_timeout}s for $CONTAINER to report healthy"
   while [ "$SECONDS" -lt "$deadline" ]; do
-    read -r status started restarts < <(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}} {{.State.StartedAt}} {{.RestartCount}}' "$CONTAINER" 2>/dev/null || echo "missing 0 0")
-    if [ "$status" = healthy ] && [[ "$started" > "$since" ]]; then
+    read -r status started restarts < <(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}} {{.State.StartedAt}} {{.RestartCount}}' "$CONTAINER" 2>/dev/null || echo "missing none 0")
+    if [ "$status" = healthy ] && [ "$started" != "$before" ]; then
       log "$CONTAINER is healthy"
       return 0
     fi
@@ -155,45 +182,60 @@ wait_healthy() {
   return 1
 }
 
-now() { date -u +%Y-%m-%dT%H:%M:%S.%NZ; }
+# A healthy state: .deploy/<name> holds rev= and image=, .deploy/<name>.env the .env.
+save_state() { # name rev image env-file
+  cp -p "$4" "$STATE_DIR/$1.env"
+  printf 'rev=%s\nimage=%s\ntime=%s\n' "$2" "$3" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_DIR/$1"
+}
+state_field() { sed -n "s/^$2=//p" "$STATE_DIR/$1"; }
 
-# Saved before any change, read by --rollback and by the automatic rollback.
-save_state() {
-  cp -p .env "$STATE_DIR/env.before"
-  printf 'rev=%s\nimage=%s\ntime=%s\n' "$1" "$2" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_DIR/before"
+# Put the files back to commit $1 and .env file $2. Called from `if`, where
+# set -e is off, so each step checks its own result.
+reset_files() {
+  git_ reset --hard -q "$1" || return 1
+  cp -p "$2" .env || return 1
+}
+# reset_files, then start a fresh container from them and wait for it.
+restore() {
+  local t
+  log "restoring ${1:0:12} and its .env"
+  reset_files "$1" "$2" || return 1
+  t="$(started_at)"
+  # Force: a config/ change leaves the definition as it was, and up -d alone
+  # would keep the container that read the bad config.
+  docker compose up -d --force-recreate "$SERVICE" || return 1
+  wait_healthy "$t"
 }
 
-# Put the clone and .env back to $1 and the saved .env, and start the server.
-restore() {
-  local rev="$1" t
-  log "rolling back to ${rev:0:12} and the saved .env"
-  git_ reset --hard -q "$rev"
-  cp -p "$STATE_DIR/env.before" .env
-  t="$(now)"
-  # Force: a config/local.toml change leaves the definition as it was, and
-  # up -d alone would keep the container that read the bad config.
-  docker compose up -d --force-recreate "$SERVICE"
-  wait_healthy "$t"
+restore_advice() {
+  log "The image changed from $1 to $2. If the newer one changed the store format,"
+  log "the older one needs the backup taken before the upgrade: docs/UPDATING.md, Rolling back."
 }
 
 # --- rollback mode -------------------------------------------------------------
 
 if [ "$do_rollback" -eq 1 ]; then
-  [ -f "$STATE_DIR/before" ] && [ -f "$STATE_DIR/env.before" ] || die "no earlier deploy recorded in $STATE_DIR"
-  prev_rev="$(sed -n 's/^rev=//p' "$STATE_DIR/before")"
-  prev_image="$(sed -n 's/^image=//p' "$STATE_DIR/before")"
-  log "last deploy started from ${prev_rev:0:12} running $prev_image"
-  if [ "$check" -eq 1 ]; then exit 0; fi
-  if [ "$yes" -eq 0 ]; then
-    read -r -p "Roll back to that? [y/N] " a; [ "$a" = y ] || [ "$a" = Y ] || exit 0
-  fi
+  [ -f "$STATE_DIR/prev" ] && [ -f "$STATE_DIR/prev.env" ] ||
+    die "no earlier healthy state recorded in $STATE_DIR (it's kept after a deploy that restarts the server)"
+  prev_rev="$(state_field prev rev)"
+  prev_image="$(state_field prev image)"
   cur_rev="$(git_ rev-parse HEAD)"
-  restore "$prev_rev" || die "the rolled-back server isn't healthy: docker compose logs $SERVICE" 1
+  cur_image="$(running_image)"
+  log "back to ${prev_rev:0:12} running $prev_image (now ${cur_rev:0:12} running $cur_image)"
+  [ "$check" -eq 1 ] && exit 0
+  if [ "$yes" -eq 0 ]; then
+    read -r -p "Roll back? [y/N] " a; [ "$a" = y ] || [ "$a" = Y ] || exit 0
+  fi
+  phase=apply
+  restore "$prev_rev" "$STATE_DIR/prev.env" || die "the rolled-back server isn't healthy: docker compose logs $SERVICE" 1
+  phase=finished
   # Don't let an unattended run deploy the commit we just left again.
-  [ "$cur_rev" != "$prev_rev" ] && echo "$cur_rev" >> "$STATE_DIR/failed"
-  record "rollback ${cur_rev:0:12} -> ${prev_rev:0:12} image=$(config_image)"
-  log "rolled back. If the newer image changed the store format, restore the backup taken before it:"
-  log "  docker compose stop $SERVICE && sudo tar -C <LORE_DATA_DIR> --zstd -xf <backup>.tar.zst && docker compose start $SERVICE   (docs/DEPLOYMENT.md, Backups)"
+  if [ "$cur_rev" != "$prev_rev" ]; then echo "$cur_rev" >> "$STATE_DIR/failed"; fi
+  mv "$STATE_DIR/prev" "$STATE_DIR/good"
+  mv "$STATE_DIR/prev.env" "$STATE_DIR/good.env"
+  record "rollback ${cur_rev:0:12} -> ${prev_rev:0:12} image=$prev_image"
+  log "rolled back"
+  if [ "$cur_image" != "$prev_image" ]; then restore_advice "$cur_image" "$prev_image"; fi
   exit 0
 fi
 
@@ -207,7 +249,7 @@ cur_branch="$(git_ symbolic-ref --short -q HEAD || echo DETACHED)"
 [ "$cur_branch" = "$branch" ] || die "the clone is on '$cur_branch', not '$branch': git switch $branch"
 
 log "fetching origin/$branch"
-git_ fetch -q origin "$branch"
+git_ fetch -q origin "$branch" || die "git fetch failed; nothing changed"
 old_rev="$(git_ rev-parse HEAD)"
 new_rev="$(git_ rev-parse FETCH_HEAD)"
 git_ merge-base --is-ancestor "$old_rev" "$new_rev" ||
@@ -219,7 +261,10 @@ run_image="$(running_image)"
 
 changed=()
 # --relative: paths under deploy/, relative to it, e.g. config/local.toml.
-[ "$old_rev" != "$new_rev" ] && mapfile -t changed < <(git_ diff --name-only --relative "$old_rev" "$new_rev")
+# --no-renames: a rename lists its old path too, so a moved config file counts.
+if [ "$old_rev" != "$new_rev" ]; then
+  mapfile -t changed < <(git_ diff --name-only --no-renames --relative "$old_rev" "$new_rev")
+fi
 
 if [ "$old_rev" != "$new_rev" ] && [ -f "$STATE_DIR/failed" ] && grep -qx "$new_rev" "$STATE_DIR/failed" && [ "$force" -eq 0 ]; then
   die "${new_rev:0:12} failed to deploy before. Push a fix, or run with --force to try it again" 3
@@ -233,13 +278,43 @@ if [ -n "$run_image" ] && [ "$run_image" != "$old_image" ]; then drift=1; fi
 if [ "${#changed[@]}" -eq 0 ] && [ "$version_change" -eq 0 ] && [ "$drift" -eq 0 ] && [ "$force" -eq 0 ]; then
   if [ "$old_rev" != "$new_rev" ]; then
     # Commits outside deploy/ only: move the clone along, nothing to restart.
-    [ "$check" -eq 1 ] || git_ merge --ff-only -q "$new_rev"
-    log "new commits outside deploy/ only; clone moved to ${new_rev:0:12}, server untouched"
+    if [ "$check" -eq 0 ]; then
+      git_ merge --ff-only -q "$new_rev" || die "git merge failed; nothing changed"
+    fi
+    log "new commits outside deploy/ only; clone at ${new_rev:0:12}, server untouched"
   else
     log "up to date at ${old_rev:0:12}, running $run_image"
   fi
   exit 0
 fi
+
+# What the deploy will do. The image comes from the new compose file and
+# .env (with --version applied) before either is changed.
+decide() { # image-to-run
+  recreate=0 restart=0
+  [ "$1" != "$run_image" ] && recreate=1
+  local f
+  for f in "${changed[@]}"; do
+    case "$f" in
+      docker-compose.yml) recreate=1 ;;
+      config/*|certs/*) restart=1 ;;
+    esac
+  done
+  # --force: a fresh container, so a hand edit to .env (ports, paths) applies too.
+  if [ "$force" -eq 1 ]; then recreate=1 restart=1; fi
+}
+plan_image="$old_image"
+if [ "$old_rev" != "$new_rev" ] || [ "$version_change" -eq 1 ]; then
+  tmp_compose="$STATE_DIR/compose.next.yml"
+  git_ show "$new_rev:./docker-compose.yml" > "$tmp_compose"
+  plan_image="$(
+    [ "$version_change" -eq 1 ] && export LORE_VERSION="$new_version"
+    docker compose -f "$tmp_compose" --project-directory "$LORE_DIR" config --images 2>/dev/null | head -n1 || true
+  )"
+  rm -f "$tmp_compose"
+  [ -n "$plan_image" ] || plan_image="(the new compose file doesn't resolve)"
+fi
+decide "$plan_image"
 
 echo
 echo "  clone:   ${old_rev:0:12} -> ${new_rev:0:12} ($branch)"
@@ -250,6 +325,16 @@ if [ "$old_rev" != "$new_rev" ]; then
 fi
 [ "$version_change" -eq 1 ] && echo "  .env:    LORE_VERSION $(env_version) -> $new_version"
 [ "$drift" -eq 1 ] && echo "  running: $run_image, but the files say $old_image (edited .env?)"
+if [ "$plan_image" != "$run_image" ]; then
+  if [ "$backup" -eq 1 ] && [ -n "$run_image" ]; then
+    echo "  action:  pull $plan_image, back up the stores (~1 min down), recreate"
+  else
+    echo "  action:  pull $plan_image, recreate"
+  fi
+elif [ "$recreate" -eq 1 ]; then echo "  action:  recreate the container (~10 s down)"
+elif [ "$restart" -eq 1 ]; then echo "  action:  restart the server (~10 s down)"
+else echo "  action:  none; the server keeps running"
+fi
 echo
 if [ "$version_change" -eq 1 ]; then
   echo "  Read the release notes for $new_version before you go on: config keys and the"
@@ -264,62 +349,75 @@ fi
 
 # --- apply ---------------------------------------------------------------------
 
-save_state "$old_rev" "${run_image:-$old_image}"
-applied=0
+cp -p .env "$STATE_DIR/before.env"
+# Where a failure goes back to: the last healthy state's .env if there is one,
+# so a bad hand edit to .env isn't restored along with the commit.
+back_env="$STATE_DIR/before.env"
+[ -f "$STATE_DIR/good.env" ] && back_env="$STATE_DIR/good.env"
+touched=0   # the server was stopped, restarted or recreated
+blame=0     # the failure is the commit's: remember it in .deploy/failed
+new_image=""
+
 # shellcheck disable=SC2329 # run by the EXIT trap
 on_failure() {
-  local rc=$?
-  [ "$applied" -eq 1 ] || exit "$rc"
-  trap - EXIT
-  [ "$old_rev" != "$new_rev" ] && echo "$new_rev" >> "$STATE_DIR/failed"
-  record "FAILED ${old_rev:0:12} -> ${new_rev:0:12} version=${new_version:-unchanged}"
+  if [ "$blame" -eq 1 ] && [ "$old_rev" != "$new_rev" ]; then echo "$new_rev" >> "$STATE_DIR/failed"; fi
+  cmp -s .env "$back_env" || cp -p .env "$STATE_DIR/failed.env"
+  record "FAILED ${old_rev:0:12} -> ${new_rev:0:12} version=${new_version:-unchanged} touched=$touched"
   if [ "$rollback_on_fail" -eq 0 ]; then
     log "deploy failed; left in place (--no-rollback). Undo with: $0 --rollback"
     exit 1
   fi
-  if restore "$old_rev"; then
-    log "deploy failed and was rolled back; the server runs the old version again"
+  if [ "$touched" -eq 0 ]; then
+    if reset_files "$old_rev" "$back_env"; then
+      log "deploy failed before the server was touched; files put back, server unchanged"
+    else
+      log "deploy failed, and putting the files back failed too: check git status and .env"
+    fi
+  elif restore "$old_rev" "$back_env"; then
+    log "deploy failed and was rolled back; the server runs the last healthy state"
+    if [ -n "$new_image" ] && [ "$new_image" != "$run_image" ]; then restore_advice "$new_image" "$run_image"; fi
   else
     log "deploy failed AND the rollback isn't healthy: docker compose logs $SERVICE"
   fi
+  if [ -f "$STATE_DIR/failed.env" ] && ! cmp -s "$STATE_DIR/failed.env" .env; then
+    log "the .env this deploy tried is kept in $STATE_DIR/failed.env"
+  fi
+  if [ "$is_root" -eq 1 ]; then chown -R "$owner": "$STATE_DIR" 2>/dev/null || true; fi
   exit 1
 }
+phase=apply
 trap on_failure EXIT
-applied=1
 
-[ "$old_rev" != "$new_rev" ] && git_ merge --ff-only -q "$new_rev"
+if [ "$old_rev" != "$new_rev" ]; then git_ merge --ff-only -q "$new_rev"; fi
 [ "$version_change" -eq 1 ] && set_env_version "$new_version"
 
 log "checking the Compose configuration"
+blame=1
 docker compose config -q
 new_image="$(config_image)"
+blame=0
+decide "$new_image"
 
-recreate=0 restart=0
-if [ "$new_image" != "${run_image:-}" ]; then
-  recreate=1
+if [ "$new_image" != "$run_image" ]; then
   log "pulling $new_image (the old server keeps running)"
   docker compose pull --quiet "$SERVICE"
   if [ "$backup" -eq 1 ] && [ -n "$run_image" ]; then
     log "image changes ($run_image -> $new_image): taking a cold backup first"
-    if [ "$(id -u)" -eq 0 ]; then
-      "$LORE_DIR/scripts/backup.sh" ${BACKUP_DIR:+"$BACKUP_DIR"}
+    touched=1
+    # This run holds the lock backup.sh would wait for.
+    if [ "$is_root" -eq 1 ]; then
+      LORE_DEPLOY_LOCK_HELD=1 "$LORE_DIR/scripts/backup.sh" ${BACKUP_DIR:+"$BACKUP_DIR"}
     else
-      sudo "$LORE_DIR/scripts/backup.sh" ${BACKUP_DIR:+"$BACKUP_DIR"}
+      sudo LORE_DEPLOY_LOCK_HELD=1 "$LORE_DIR/scripts/backup.sh" ${BACKUP_DIR:+"$BACKUP_DIR"}
     fi
   fi
 fi
-for f in "${changed[@]}"; do
-  case "$f" in
-    docker-compose.yml) recreate=1 ;;
-    config/*|certs/*) restart=1 ;;
-  esac
-done
-# --force: a fresh container, so a hand edit to .env (ports, paths) applies too.
-[ "$force" -eq 1 ] && recreate=1 restart=1
 
-t="$(now)"
+blame=1
+t="$(started_at)"
 if [ "$recreate" -eq 1 ]; then
   log "recreating $SERVICE"
+  touched=1
   if [ "$restart" -eq 1 ]; then
     # The definition may be unchanged, and up -d would then keep the container.
     docker compose up -d --force-recreate "$SERVICE"
@@ -329,13 +427,27 @@ if [ "$recreate" -eq 1 ]; then
   wait_healthy "$t"
 elif [ "$restart" -eq 1 ]; then
   log "restarting $SERVICE for the config change"
+  touched=1
   docker compose restart "$SERVICE"
   wait_healthy "$t"
 else
   log "only scripts or docs changed; the server keeps running"
 fi
 
-trap - EXIT
+phase=finished
+trap on_exit EXIT
+# The rollback point moves only when the running server changed, so a later
+# docs-only deploy doesn't hide the state before an upgrade.
+if [ "$touched" -eq 1 ]; then
+  if [ -f "$STATE_DIR/good" ]; then
+    mv "$STATE_DIR/good" "$STATE_DIR/prev"
+    mv "$STATE_DIR/good.env" "$STATE_DIR/prev.env"
+  else
+    save_state prev "$old_rev" "${run_image:-$old_image}" "$STATE_DIR/before.env"
+  fi
+fi
+save_state good "$new_rev" "$new_image" .env
+rm -f "$STATE_DIR/failed.env"
 record "ok ${old_rev:0:12} -> ${new_rev:0:12} image=$new_image"
 log "deployed ${new_rev:0:12}, running $new_image"
 docker compose ps "$SERVICE"

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Stub docker for tests/test-deploy.sh: the commands deploy.sh and backup.sh
+# run, with the container's state in files under $STUB_DIR, and each call
+# appended to $STUB_DIR/calls. A config/local.toml holding STUB_CRASH makes the
+# server crash-loop; a compose file holding STUB_BROKEN doesn't resolve; an
+# image tag holding "missing" can't be pulled.
+set -euo pipefail
+S="${STUB_DIR:?}"
+echo "$*" >> "$S/calls"
+
+# The image the compose file names: ${LORE_VERSION:-x} from the environment,
+# else .env in the project directory, else x.
+image_of() { # compose-file project-dir
+  local line ver default
+  line="$(sed -n 's/^ *image: *//p' "$1" | head -n1)"
+  default="$(printf '%s' "$line" | sed -n 's/.*:-\([^}]*\)}.*/\1/p')"
+  ver="${LORE_VERSION:-$(sed -n 's/^LORE_VERSION=//p' "$2/.env" 2>/dev/null | tail -n1)}"
+  printf '%s\n' "$line" | sed "s/\${LORE_VERSION:-[^}]*}/${ver:-$default}/"
+}
+start() { # image
+  echo "$1" > "$S/image"
+  echo $(( $(cat "$S/started") + 1 )) > "$S/started"
+  echo 0 > "$S/restarts"
+  if grep -q STUB_CRASH config/local.toml; then echo crash > "$S/health"; else echo healthy > "$S/health"; fi
+}
+
+case "$1" in
+  inspect)
+    fmt="$3"
+    [ -f "$S/image" ] || exit 1
+    if [ "$(cat "$S/health" 2>/dev/null)" = crash ]; then
+      echo $(( $(cat "$S/restarts") + 1 )) > "$S/restarts"
+      status=starting
+    else
+      status=healthy
+    fi
+    case "$fmt" in
+      *Config.Image*) cat "$S/image" ;;
+      *RestartCount*Health*|*Health*RestartCount*) echo "$status $(cat "$S/started") $(cat "$S/restarts" 2>/dev/null || echo 0)" ;;
+      *RestartCount*) cat "$S/restarts" 2>/dev/null || echo 0 ;;
+      *StartedAt*) cat "$S/started" ;;
+    esac
+    ;;
+  compose)
+    shift
+    file=docker-compose.yml dir=.
+    while [ "${1:-}" = -f ] || [ "${1:-}" = --project-directory ]; do
+      [ "$1" = -f ] && file="$2" || dir="$2"; shift 2
+    done
+    case "$1" in
+      version) echo "Docker Compose version stub" ;;
+      config)
+        grep -q STUB_BROKEN "$file" && { echo "invalid compose file" >&2; exit 1; }
+        if [ "${2:-}" = --images ]; then image_of "$file" "$dir"; fi
+        ;;
+      pull)
+        case "$(image_of "$file" "$dir")" in *missing*) echo "not found" >&2; exit 1 ;; esac ;;
+      up|restart|start) start "$(image_of "$file" "$dir")" ;;
+      stop|logs|ps) ;;
+    esac
+    ;;
+esac

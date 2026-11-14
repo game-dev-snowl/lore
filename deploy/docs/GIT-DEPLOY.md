@@ -1,6 +1,6 @@
 # Deploy from a git clone
 
-This runbook puts a clone of [game-dev-snowl/lore](https://github.com/game-dev-snowl/lore) at `/opt/lore` on the server, instead of the copy made with `rsync`. The deployment runs from `/opt/lore/deploy`, and an update is a `git pull`.
+This runbook puts a clone of [game-dev-snowl/lore](https://github.com/game-dev-snowl/lore) at `/opt/lore` on the server, instead of the copy made with `rsync`. The deployment runs from `/opt/lore/deploy`, and an update is `scripts/deploy.sh`, which pulls ([UPDATING.md](UPDATING.md)).
 
 The clone is sparse and blob-less: it checks out `deploy/` and the files at the repository root, a few MB, not Lore's source. The repository is public, so the server needs no GitHub credentials.
 
@@ -17,7 +17,7 @@ The values below are for the home-LAN server. For the public mode, do A.1, run A
 | | rsync copy | git clone |
 |---|---|---|
 | Working directory | `/opt/lore` | `/opt/lore/deploy` |
-| Update | `rsync` from your machine | `git pull` on the server |
+| Update | `rsync` from your machine | `./scripts/deploy.sh` on the server (a `git pull` and the restart it needs) |
 | Backup cron | `/opt/lore/scripts/backup.sh` | `/opt/lore/deploy/scripts/backup.sh` |
 | Host-local files (`.env`, `certs/*.pem`, `ca/`) | in `/opt/lore` | in `/opt/lore/deploy`, ignored by git |
 
