@@ -43,6 +43,8 @@ Safety rails:
 - It waits until Docker reports the container healthy, and gives up early if the server is crash-looping (a bad `local.toml` fails in about 10 s).
 - On failure it rolls back on its own. A failure before the server is touched (a merge, a pull, a Compose file that doesn't resolve) only puts the files back; the server keeps running. A fetch that fails stops the run before anything changes. A failure after it starts a fresh container from the previous commit and the last healthy `.env`.
 - A commit whose Compose file doesn't resolve, or whose server doesn't come up, goes into `.deploy/failed`, so an unattended run won't try it again until a newer commit lands, or you pass `--force`. A network or registry error doesn't: the next run tries again.
+- If a rollback doesn't come up healthy either, later runs exit 3 rather than deploy over a server that's down, until a `--force` deploy or a `--rollback` succeeds. A scripts-only deploy also fails while the server is unhealthy, since nothing would check it.
+- On its first run it records the running server as the healthy state to go back to, so a later hand edit to `.env` that fails can be undone.
 - It never changes the stores. If a new image changed the store format, going back to the old image needs the backup restored ([Rolling back](#rolling-back)).
 
 ## Part 1: the first update with deploy.sh
@@ -103,7 +105,7 @@ Compare `grep LORE_VERSION .env` with the newest release at <https://github.com/
 2. Open a pull request and merge it to `main`.
 3. On the server: `cd /opt/lore/deploy && ./scripts/deploy.sh`, or let the timer do it ([Part 3](#part-3-automating-it)).
 
-Host-local values (domain, bind addresses, data directory, image version) live in `.env`, which isn't in git. After editing `.env` by hand, run `./scripts/deploy.sh --force` so the container picks it up and is health-checked.
+Host-local values (domain, bind addresses, data directory, image version) live in `.env`, which isn't in git. After editing `.env` by hand, run `./scripts/deploy.sh --force` so the container picks it up and is health-checked. Run `deploy.sh` at least once before the first hand edit: that run records the running server as the state a failure goes back to. Without one, a deploy refuses to apply an edited image version unless you pass `--force`.
 
 ### Upgrading the Lore image
 
@@ -139,7 +141,7 @@ Restore it with the timer stopped, so no deploy starts the server on a half-rest
 ```bash
 sudo systemctl stop lore-deploy.timer          # if you set it up
 docker compose stop loreserver
-sudo sh -c 'find /srv/lore/data -mindepth 1 -delete && tar -C /srv/lore/data --zstd -xf /srv/lore/backups/lore-data-<stamp>.tar.zst'
+sudo sh -c 'find <LORE_DATA_DIR> -mindepth 1 -delete && tar -C <LORE_DATA_DIR> --zstd -xf <the archive named above>'
 docker compose start loreserver
 sudo systemctl start lore-deploy.timer
 ```
@@ -173,7 +175,7 @@ Environment: `HEALTH_TIMEOUT` (default 180 s), `BACKUP_DIR` (default `/srv/lore/
 | 0 | deployed, or nothing to do |
 | 1 | the deploy failed; the files are back, and the server too if it was touched. The output says whether that rollback is healthy |
 | 2 | refused or failed before changing anything: bad option, edited tracked file, missing `.env`, fetch failed |
-| 3 | the target commit failed before; push a fix or pass `--force` |
+| 3 | the target commit failed before, or the last rollback left the server unhealthy; fix it, then pass `--force` |
 | 4 | another deploy or a backup holds the lock |
 
 State lives in `/opt/lore/deploy/.deploy/` (ignored by git):
@@ -184,7 +186,8 @@ State lives in `/opt/lore/deploy/.deploy/` (ignored by git):
 | `failed` | commits not to deploy again without `--force` |
 | `good`, `good.env` | the running healthy state: commit, image, the backup taken before it, `.env` |
 | `prev`, `prev.env` | the healthy state before it, which `--rollback` restores |
-| `pending` | a failed deploy left in place with `--no-rollback`; `--rollback` then restores `good` |
+| `pending` | a failed deploy left in place with `--no-rollback`; `--rollback` then puts back what it replaced |
+| `broken` | a rollback that didn't come up healthy; deploys exit 3 until one with `--force` or a `--rollback` succeeds |
 | `failed.env` | the `.env` a failed deploy tried, when it differs from the restored one |
 
 `tests/test-deploy.sh` tests both scripts with stub `docker`, `sudo` and `runuser` commands; run it after changing `deploy.sh` or `backup.sh`.
@@ -278,6 +281,8 @@ ExecStart=/usr/bin/curl -fsS -d "lore deploy failed on %H: journalctl -u lore-de
 | `tracked files were changed on the server` | Someone edited a file on the server. `git diff` shows it. Move the change into the repository, then `git checkout -- <file>`. |
 | `<commit> failed to deploy before` (exit 3) | The last deploy of that commit failed and was rolled back. Fix it on `main`; the next commit deploys. To retry the same commit: `--force`. |
 | `another deploy or a backup is running` (exit 4) | The timer or a backup is mid-run. Wait, or check `pgrep -af 'deploy.sh\|backup.sh'`. The lock is released when the process exits, even if it was killed. |
+| `no healthy state is recorded to go back to` | `.env` names another image than the one running, and `deploy.sh` has never run here. Undo the edit, run `deploy.sh` once, then upgrade with `--version`. |
+| `the last rollback left the server unhealthy` (exit 3) | A rollback didn't come up. Fix the server by hand, then `deploy.sh --force`, or `--rollback` again. |
 | `run this as <user>, who owns …` | The script runs git as the clone's owner. Run it as that user, or with `sudo`. |
 | `isn't a git clone` | The server still runs the rsync copy. [GIT-DEPLOY.md, part B](GIT-DEPLOY.md#b-replace-an-existing-rsync-copy). |
 | `the clone is on 'X', not 'main'` | `git -C /opt/lore switch main`, or pass `--branch X`. |

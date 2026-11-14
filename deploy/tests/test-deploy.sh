@@ -10,8 +10,9 @@
 # command as the caller, so the suite runs as any user. Needs git, bash,
 # flock, tar and zstd; no Docker.
 #
-# Not covered: real Docker and Compose (restart and health semantics), and
-# file ownership after a root run; check those by hand on a test host.
+# Not covered: real Docker and Compose (restart and health semantics), file
+# ownership after a root run, and the refusal to run as a user who neither
+# owns the clone nor is root; check those by hand on a test host.
 # shellcheck disable=SC2016,SC2034 # checks are strings run by eval, which reads these
 set -euo pipefail
 
@@ -188,6 +189,7 @@ deploy --rollback
 check "  ... then --rollback returns to the state it replaced" '[ $rc -eq 0 ] && [ "$(rev)" = "$good_rev" ] && [ ! -f "$D/.deploy/pending" ]'
 
 setup
+deploy
 sed -i 's/^LORE_VERSION=.*/LORE_VERSION=0.14.0/' "$D/.env"
 deploy
 check "hand-edited LORE_VERSION (drift): pull, backup, recreate" '[ $rc -eq 0 ] && [ "$(cat "$STUB_DIR/image")" = ghcr.io/epicgames/lore/loreserver:0.14.0 ] && ls "$C/backups"/lore-data-*.tar.zst >/dev/null'
@@ -221,6 +223,65 @@ push crash bash -c 'echo "# STUB_CRASH" >> config/local.toml'
 deploy
 deploy --check
 check "--check on a commit that failed before: shows the plan, exit 0" '[ $rc -eq 0 ] && grep -q "needs --force" "$out" && grep -q "action:" "$out"'
+
+setup
+deploy --version 0.14.0
+push docs bash -c 'echo more >> docs/UPDATING.md'
+deploy
+sed -i 's/^LORE_VERSION=.*/LORE_VERSION=0.13.0-crash/' "$D/.deploy/prev.env"
+deploy --rollback
+check "rollback that doesn't come up: exit 1" '[ $rc -eq 1 ] && [ -f "$D/.deploy/broken" ]'
+push docs2 bash -c 'echo more >> docs/UPDATING.md'
+deploy
+check "  ... later runs refuse with exit 3 instead of reporting a deploy" '[ $rc -eq 3 ]'
+deploy --force --version 0.14.0
+check "  ... a --force deploy that comes up clears it" '[ $rc -eq 0 ] && [ ! -f "$D/.deploy/broken" ]'
+
+setup
+push config sed -i 's/flush_delay_seconds = 10/flush_delay_seconds = 5/' config/local.toml
+deploy
+deploy --version 0.14.0-crash --no-rollback
+deploy --rollback
+check "--no-rollback upgrade, then --rollback: back to 0.13.0, names the backup" '[ $rc -eq 0 ] && [ "$(cat "$STUB_DIR/image")" = ghcr.io/epicgames/lore/loreserver:0.13.0 ] && grep -q "That backup is $C/backups/lore-data-" "$out"'
+check "  ... and history.log names it on the failed line" 'grep "FAILED" "$D/.deploy/history.log" | grep -q "backup=$C/backups/lore-data-"'
+
+setup
+deploy
+sed -i 's/^LORE_VERSION=.*/LORE_VERSION=0.14.0-crash/' "$D/.env"
+deploy
+check "hand edit after a first run that changed nothing: fails back to the running server" '[ $rc -eq 1 ] && [ "$(cat "$STUB_DIR/image")" = ghcr.io/epicgames/lore/loreserver:0.13.0 ] && grep -q "rolled back" "$out"'
+
+setup
+sed -i 's/^LORE_VERSION=.*/LORE_VERSION=0.14.0-crash/' "$D/.env"
+deploy
+check "hand edit before any run: refused with exit 2, server untouched" '[ $rc -eq 2 ] && [ -z "$(calls)" ]'
+
+setup
+push config sed -i 's/flush_delay_seconds = 10/flush_delay_seconds = 5/' config/local.toml
+deploy
+echo "RUST_LOG=debug" >> "$D/.env"
+deploy --version 0.13.9-missing
+check "failure that never touched the server keeps a hand edit to .env" '[ $rc -eq 1 ] && grep -qx RUST_LOG=debug "$D/.env"'
+
+setup
+deploy --version 0.13.9-missing --no-rollback
+reset_calls
+deploy --rollback
+check "--no-rollback failure that never touched the server: --rollback puts files back only" '[ $rc -eq 0 ] && [ -z "$(calls)" ] && grep -qx LORE_VERSION=0.13.0 "$D/.env"'
+
+setup
+deploy --version 0.14.0
+echo "# edited" >> "$D/docker-compose.yml"
+deploy --rollback
+check "--rollback over an edited tracked file: exit 2, edit kept" '[ $rc -eq 2 ] && grep -q "# edited" "$D/docker-compose.yml"'
+
+setup
+push crash bash -c 'echo "# STUB_CRASH" >> config/local.toml'
+sed -i 's/^LORE_VERSION=.*/LORE_VERSION=0.13.0/;$a RUST_LOG=x' "$D/.env"
+deploy --force
+push fix bash -c 'sed -i "/STUB_CRASH/d" config/local.toml'
+deploy
+check "a successful deploy clears the failed.env of the failure before it" '[ $rc -eq 0 ] && [ ! -f "$D/.deploy/failed.env" ]'
 
 echo "backup.sh"
 

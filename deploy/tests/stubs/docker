@@ -48,6 +48,7 @@ case "$1" in
       *Config.Image*) cat "$S/image" ;;
       *RestartCount*Health*|*Health*RestartCount*) echo "$status $(cat "$S/started") $(cat "$S/restarts" 2>/dev/null || echo 0)" ;;
       *RestartCount*) cat "$S/restarts" 2>/dev/null || echo 0 ;;
+      *Health*) echo "$status" ;;
       *StartedAt*) cat "$S/started" ;;
     esac
     ;;

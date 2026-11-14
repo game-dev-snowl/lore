@@ -166,6 +166,7 @@ set_env_version() {
 config_image() { docker compose config --images 2>/dev/null | head -n1 || true; }
 running_image() { docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true; }
 started_at() { docker inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null || echo none; }
+health() { docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$CONTAINER" 2>/dev/null || echo missing; }
 
 # Healthy, in a container started after $1 (its StartedAt before the action),
 # so the status of the container we replaced doesn't count.
@@ -231,8 +232,22 @@ if [ "$do_rollback" -eq 1 ]; then
     git_ status --short
     die "tracked files were changed on the server; a rollback would discard them. Move the change to the repository first"
   fi
-  # After a failed deploy left in place (--no-rollback), the state to return
-  # to is the last healthy one, good; otherwise the one before it, prev.
+  cur_rev="$(git_ rev-parse HEAD)"
+  cur_image="$(running_image)"
+  # After a failed deploy left in place (--no-rollback), return to the state
+  # it replaced: only the files if it never touched the server, else good.
+  # Otherwise return to the state before good, prev.
+  if [ -f "$STATE_DIR/pending" ] && [ "$(state_field pending touched)" = 0 ]; then
+    to_rev="$(state_field pending rev)"
+    [ "$check" -eq 1 ] && { log "back to ${to_rev:0:12}: files only, the server was never touched"; exit 0; }
+    phase=apply
+    reset_files "$to_rev" "$STATE_DIR/before.env" || die "putting the files back failed: check git status and .env" 1
+    phase=finished
+    rm -f "$STATE_DIR/pending"
+    record "rollback ${cur_rev:0:12} -> ${to_rev:0:12} files only"
+    log "files put back to ${to_rev:0:12}; the server was never touched"
+    exit 0
+  fi
   target=prev
   [ -f "$STATE_DIR/pending" ] && target=good
   [ -f "$STATE_DIR/$target" ] && [ -f "$STATE_DIR/$target.env" ] ||
@@ -240,10 +255,7 @@ if [ "$do_rollback" -eq 1 ]; then
   to_rev="$(state_field "$target" rev)"
   to_image="$(state_field "$target" image)"
   # The archive taken before the state we leave started.
-  from_backup=""
-  if [ "$target" = prev ]; then from_backup="$(state_field good backup 2>/dev/null || true)"; fi
-  cur_rev="$(git_ rev-parse HEAD)"
-  cur_image="$(running_image)"
+  if [ "$target" = prev ]; then from_backup="$(state_field good backup)"; else from_backup="$(state_field pending backup)"; fi
   log "back to ${to_rev:0:12} running $to_image (now ${cur_rev:0:12} running $cur_image)"
   [ "$check" -eq 1 ] && exit 0
   if [ "$yes" -eq 0 ]; then
@@ -252,7 +264,9 @@ if [ "$do_rollback" -eq 1 ]; then
   phase=apply
   if ! restore "$to_rev" "$STATE_DIR/$target.env"; then
     if [ "$cur_image" != "$to_image" ]; then restore_advice "$cur_image" "$to_image" "$from_backup"; fi
-    die "the rolled-back server isn't healthy: docker compose logs $SERVICE" 1
+    echo "$to_rev" > "$STATE_DIR/broken"
+    record "FAILED rollback ${cur_rev:0:12} -> ${to_rev:0:12}"
+    die "the rolled-back server isn't healthy: docker compose logs $SERVICE. Deploys stop until one with --force or a --rollback succeeds" 1
   fi
   phase=finished
   # Don't let an unattended run deploy the commit we just left again.
@@ -261,7 +275,7 @@ if [ "$do_rollback" -eq 1 ]; then
     mv "$STATE_DIR/prev" "$STATE_DIR/good"
     mv "$STATE_DIR/prev.env" "$STATE_DIR/good.env"
   fi
-  rm -f "$STATE_DIR/pending"
+  rm -f "$STATE_DIR/pending" "$STATE_DIR/broken"
   record "rollback ${cur_rev:0:12} -> ${to_rev:0:12} image=$to_image"
   log "rolled back"
   if [ "$cur_image" != "$to_image" ]; then restore_advice "$cur_image" "$to_image" "$from_backup"; fi
@@ -288,6 +302,15 @@ old_image="$(config_image)"
 run_image="$(running_image)"
 [ -n "$old_image" ] || die "docker compose config fails on the current files: run it to see why"
 
+if [ -f "$STATE_DIR/broken" ] && [ "$force" -eq 0 ] && [ "$check" -eq 0 ]; then
+  die "the last rollback left the server unhealthy. Fix it, then deploy with --force or run --rollback" 3
+fi
+# The first run has no healthy state to go back to: take the running server
+# as one, if it is healthy and runs what the files name.
+if [ "$check" -eq 0 ] && [ ! -f "$STATE_DIR/good" ] && [ -n "$run_image" ] && [ "$run_image" = "$old_image" ] && [ "$(health)" = healthy ]; then
+  save_state good "$old_rev" "$run_image" .env
+fi
+
 changed=()
 # --relative: paths under deploy/, relative to it, e.g. config/local.toml.
 # --no-renames: a rename lists its old path too, so a moved config file counts.
@@ -304,6 +327,11 @@ version_change=0
 if [ -n "$new_version" ] && [ "$new_version" != "$(env_version)" ]; then version_change=1; fi
 drift=0
 if [ -n "$run_image" ] && [ "$run_image" != "$old_image" ]; then drift=1; fi
+# A hand edit to .env with no healthy state recorded: a failure would have
+# nothing to go back to but the edit itself.
+if [ "$drift" -eq 1 ] && [ ! -f "$STATE_DIR/good" ] && [ "$force" -eq 0 ] && [ "$check" -eq 0 ]; then
+  die "the server runs $run_image but .env names $old_image, and no healthy state is recorded to go back to. Undo the edit and run this once, then use --version; or pass --force to go ahead without a way back"
+fi
 
 if [ "${#changed[@]}" -eq 0 ] && [ "$version_change" -eq 0 ] && [ "$drift" -eq 0 ] && [ "$force" -eq 0 ]; then
   if [ "$old_rev" != "$new_rev" ]; then
@@ -342,7 +370,7 @@ if [ "$old_rev" != "$new_rev" ] || [ "$version_change" -eq 1 ]; then
     docker compose -f "$tmp_compose" --project-directory "$LORE_DIR" config --images 2>/dev/null | head -n1 || true
   )"
   rm -f "$tmp_compose"
-  [ -n "$plan_image" ] || plan_image="(the new compose file doesn't resolve)"
+  [ -n "$plan_image" ] || plan_image=""
 fi
 decide "$plan_image"
 
@@ -355,7 +383,9 @@ if [ "$old_rev" != "$new_rev" ]; then
 fi
 [ "$version_change" -eq 1 ] && echo "  .env:    LORE_VERSION $(env_version) -> $new_version"
 [ "$drift" -eq 1 ] && echo "  running: $run_image, but the files say $old_image (edited .env?)"
-if [ "$plan_image" != "$run_image" ]; then
+if [ -z "$plan_image" ]; then
+  echo "  action:  none: the new compose file doesn't resolve, so the deploy will fail"
+elif [ "$plan_image" != "$run_image" ]; then
   if [ "$backup" -eq 1 ] && [ -n "$run_image" ]; then
     echo "  action:  pull $plan_image, back up the stores (~1 min down), recreate"
   else
@@ -393,12 +423,15 @@ backup_file=""
 
 # shellcheck disable=SC2329 # run by the EXIT trap
 on_failure() {
-  local to_image
+  # Each step below checks its own result; a failed write to .deploy (a full
+  # disk) mustn't stop the restore.
+  set +e
+  local to_image tried
   if [ "$blame" -eq 1 ] && [ "$old_rev" != "$new_rev" ]; then echo "$new_rev" >> "$STATE_DIR/failed"; fi
-  record "FAILED ${old_rev:0:12} -> ${new_rev:0:12} version=${new_version:-unchanged} touched=$touched"
+  record "FAILED ${old_rev:0:12} -> ${new_rev:0:12} version=${new_version:-unchanged} touched=$touched${backup_file:+ backup=$backup_file}"
   if [ "$rollback_on_fail" -eq 0 ]; then
-    # Tells --rollback to return to good, the state this deploy replaced.
-    echo "$new_rev" > "$STATE_DIR/pending"
+    # Tells --rollback what this deploy replaced.
+    printf 'rev=%s\ntouched=%s\nbackup=%s\n' "$old_rev" "$touched" "$backup_file" > "$STATE_DIR/pending"
     log "deploy failed; left in place (--no-rollback). Undo with: $0 --rollback"
     finish 1
   fi
@@ -414,7 +447,9 @@ on_failure() {
   if restore "$old_rev" "$back_env"; then
     log "deploy failed and was rolled back; the server runs the last healthy state"
   else
+    echo "$old_rev" > "$STATE_DIR/broken"
     log "deploy failed AND the rollback isn't healthy: docker compose logs $SERVICE"
+    log "Deploys stop until one with --force or a --rollback succeeds."
   fi
   # The image the rollback started may differ from the one the deploy tried,
   # whether or not the rollback came up: the stores may need the backup.
@@ -473,6 +508,10 @@ elif [ "$restart" -eq 1 ]; then
   docker compose restart "$SERVICE"
   wait_healthy "$t"
 else
+  # Nothing restarts, so nothing was health-checked: don't call an unhealthy
+  # server deployed. The files go back; the server is left as it is.
+  blame=0
+  [ "$(health)" = healthy ] || { log "$CONTAINER isn't healthy ($(health)); not recording this deploy"; false; }
   log "only scripts or docs changed; the server keeps running"
 fi
 
@@ -496,6 +535,7 @@ elif [ -f "$STATE_DIR/good" ]; then
 else
   save_state good "$new_rev" "$new_image" .env
 fi
+rm -f "$STATE_DIR/broken"
 record "ok ${old_rev:0:12} -> ${new_rev:0:12} image=$new_image${backup_file:+ backup=$backup_file}"
 log "deployed ${new_rev:0:12}, running $new_image"
 docker compose ps "$SERVICE"
